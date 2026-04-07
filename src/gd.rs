@@ -35,9 +35,6 @@ pub struct LevelInfo {
 }
 
 /// Fetches level info by ID from the Boomlings API. Returns `None` if the level doesn't exist.
-///
-/// The API signals "not found" with the literal body `"-1"` rather than a 4xx status.
-/// The `secret` field is a fixed token hardcoded into every GD client.
 pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
     let body = HTTP
         .post("https://www.boomlings.com/database/getGJLevels21.php")
@@ -88,10 +85,7 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
     }))
 }
 
-// Section 0 is a flat stride-2 key:value:key:value:... sequence. Free-text values like
-// descriptions are base64url-encoded by the server specifically to prevent raw colons from
-// breaking this format, so `:` will never appear unescaped in any value we care about.
-// Duplicate keys are not expected; if they occur, HashMap collect silently keeps the last value.
+// Section 0 is a flat stride-2 key:value:key:value:... sequence.
 fn parse_kv(section: &str) -> HashMap<&str, &str> {
     section
         .split(':')
@@ -101,8 +95,7 @@ fn parse_kv(section: &str) -> HashMap<&str, &str> {
         .collect()
 }
 
-// Section 1 entries are `playerID:username:accountID`. We only need the first two fields;
-// splitn(3) avoids splitting on a colon that might appear inside an accountID-adjacent value.
+// Section 1 entries are `playerID:username:accountID`.
 fn parse_creators(section: &str) -> HashMap<&str, &str> {
     section
         .split('|')
@@ -114,8 +107,7 @@ fn parse_creators(section: &str) -> HashMap<&str, &str> {
         .collect()
 }
 
-// Descriptions are URL-safe base64 with no padding. The encoding exists solely to keep
-// colons out of the value — the stride-2 parser would misalign if they appeared raw.
+// Descriptions are URL-safe base64 with no padding.
 fn decode_description(raw: Option<&str>) -> String {
     raw.and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -123,8 +115,7 @@ fn decode_description(raw: Option<&str>) -> String {
 }
 
 // Difficulty spans three keys: key 17 (is demon), key 25 (is auto), and key 9 (the
-// denominator: 10/20/30/40/50 for Easy–Insane). For demons, key 43 gives the sub-type —
-// Hard Demon is the implicit default and has no dedicated value, hence the catch-all arm.
+// denominator: 10/20/30/40/50 for Easy–Insane). For demons, key 43 gives the sub-type. Hard Demon is the implicit default.
 fn resolve_difficulty(kv: &HashMap<&str, &str>) -> String {
     if kv.get("17").copied() == Some("1") {
         return match kv.get("43").copied() {
@@ -164,10 +155,7 @@ fn resolve_length(kv: &HashMap<&str, &str>) -> String {
     .to_owned()
 }
 
-// Key 35 holds the Newgrounds song ID. Absent or "0" both mean "use the official soundtrack".
-//
-// The song section (section 2) uses `~|~` as its delimiter, unlike the `:` used everywhere
-// else. It's the same stride-2 key-value structure, just a different separator.
+// Key 35 holds the Newgrounds song ID. Absent or "0" both mean the song is from the base game.
 fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String, String, u32) {
     let Some(target_id) = kv.get("35").copied().filter(|&id| id != "0") else {
         let idx = kv

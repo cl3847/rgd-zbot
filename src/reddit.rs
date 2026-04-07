@@ -18,7 +18,7 @@ use crate::gd::{LevelInfo, search_level};
 const SUBREDDIT: &str = "geometrydash";
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const MAX_AGE_SECS: u64 = 60;
-const FOOTER: &str = "^This ^is ^an ^automated ^message. ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot)";
+const FOOTER: &str = "^this ^is ^an ^automated ^message. ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) | ^[source/contribute](https://github.com/cl3847/rgd-zbot/)";
 
 // Both patterns capture the level ID in group 1.
 static ID_PATTERNS: LazyLock<[Regex; 2]> = LazyLock::new(|| {
