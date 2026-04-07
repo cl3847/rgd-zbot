@@ -1,1 +1,1 @@
-worker: npm start
+worker: ./target/release/rgd-zbot

@@ -1,0 +1,18 @@
+[package]
+name = "rgd-zbot"
+version = "2.0.0"
+edition = "2024"
+
+[dependencies]
+roux = "=2.2.15"
+roux-stream = "=0.2.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = "0.12"
+dotenvy = "0.15"
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+base64 = "0.22"
+tokio-retry = "0.3"
+futures = "0.3"
