@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use roux::Me;
-use roux::util::RouxError;
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
 
@@ -33,7 +32,7 @@ const MOD_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum number of post IDs retained in the seen-post deduplication cache.
 const SEEN_ID_CAPACITY: usize = 500;
 /// Reddit superscript footer appended to every bot reply.
-const FOOTER: &str = "^(automated) ^| by ^[Sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) ^| ^[source](https://github.com/cl3847/rgd-zbot/)";
+const FOOTER: &str = "^(Automated) ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) ^| ^[source](https://github.com/cl3847/rgd-zbot/)";
 
 /// Credentials and metadata required to create or refresh an authenticated Reddit session.
 #[derive(Clone)]
@@ -95,6 +94,14 @@ enum FetchOutcome {
     Unauthorized,
 }
 
+/// Result of posting a comment to Reddit.
+enum PostCommentOutcome {
+    /// Comment was created; contains the new comment's fullname (e.g. `"t1_abc123"`).
+    Success(String),
+    /// The OAuth token has expired and should be refreshed before retrying.
+    Unauthorized,
+}
+
 /// Minimal response shape for Reddit's `/api/comment` endpoint.
 #[derive(Deserialize)]
 struct CommentApiResponse {
@@ -103,6 +110,8 @@ struct CommentApiResponse {
 
 #[derive(Deserialize)]
 struct CommentApiJson {
+    /// Non-empty when Reddit rejects the request (e.g. rate-limit, banned).
+    errors: Vec<serde_json::Value>,
     data: Option<CommentApiData>,
 }
 
@@ -144,9 +153,10 @@ impl fmt::Display for PostReplyBlock<'_> {
             info.name, info.creator_username, info.id
         )?;
 
-        if !info.description.is_empty() {
+        let description = info.description.trim();
+        if !description.is_empty() {
             // Newlines in the description would break out of the blockquote; flatten them.
-            let desc = info.description.replace('\n', " ");
+            let desc = description.replace('\n', " ");
             write!(f, "\n\n> {desc}")?;
         }
 
@@ -230,11 +240,6 @@ fn remember_seen(
     true
 }
 
-/// Returns true when a roux error is a 401 status response.
-fn is_unauthorized_roux_error(error: &RouxError) -> bool {
-    matches!(error, RouxError::Status(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED)
-}
-
 /// Replaces the current Reddit session with a freshly authenticated one.
 async fn refresh_session(auth: &RedditAuth, me: &mut Me) -> Result<()> {
     tracing::warn!("refreshing expired Reddit OAuth session");
@@ -242,11 +247,56 @@ async fn refresh_session(auth: &RedditAuth, me: &mut Me) -> Result<()> {
     Ok(())
 }
 
-/// Extracts the new comment's fullname from Reddit's `/api/comment` response body.
-async fn parse_comment_fullname(response: reqwest::Response) -> Option<String> {
-    let body = response.text().await.ok()?;
-    let parsed: CommentApiResponse = serde_json::from_str(&body).ok()?;
-    parsed.json.data?.things.into_iter().next()?.data.name
+/// Posts a comment reply using `api_type=json` and returns the new comment's fullname.
+///
+/// Using `api_type=json` is required — without it Reddit returns a jQuery-based response
+/// format that cannot be parsed as structured JSON.
+async fn post_comment(me: &Me, reply: &str, parent_fullname: &str) -> Result<PostCommentOutcome> {
+    let form = [
+        ("api_type", "json"),
+        ("text", reply),
+        ("parent", parent_fullname),
+    ];
+    let response = me
+        .client
+        .post("https://oauth.reddit.com/api/comment")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| anyhow!("request failed: {e}"))?;
+
+    let status = response.status();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(PostCommentOutcome::Unauthorized);
+    }
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "status={} body_prefix={:?}",
+            status,
+            response_preview(&body)
+        );
+    }
+
+    let parsed: CommentApiResponse = response
+        .json()
+        .await
+        .map_err(|e| anyhow!("failed to decode comment response: {e}"))?;
+
+    if !parsed.json.errors.is_empty() {
+        bail!("Reddit API errors: {:?}", parsed.json.errors);
+    }
+
+    let fullname = parsed
+        .json
+        .data
+        .and_then(|d| d.things.into_iter().next())
+        .and_then(|t| t.data.name)
+        .ok_or_else(|| anyhow!("comment fullname missing from response"))?;
+
+    Ok(PostCommentOutcome::Success(fullname))
 }
 
 /// Fetches the most recent posts from the monitored subreddit via the OAuth listing endpoint.
@@ -384,38 +434,31 @@ async fn post_reply(
     let mut refreshed = false;
 
     loop {
-        let result = timeout(REPLY_TIMEOUT, me.comment(reply, submission_fullname)).await;
-        match result {
-            Ok(Ok(response)) => {
+        match timeout(REPLY_TIMEOUT, post_comment(me, reply, submission_fullname)).await {
+            Ok(Ok(PostCommentOutcome::Success(comment_fullname))) => {
                 tracing::info!(post = post_id, level_id, "replied");
-                match parse_comment_fullname(response).await {
-                    Some(comment_fullname) => {
-                        if let Err(error) = sticky_comment(auth, me, &comment_fullname).await {
-                            tracing::warn!(
-                                post = post_id,
-                                comment = comment_fullname,
-                                "failed to distinguish/sticky reply: {error}"
-                            );
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            post = post_id,
-                            "could not extract comment fullname from reply response; skipping distinguish/sticky"
-                        );
-                    }
+                if let Err(error) = sticky_comment(auth, me, &comment_fullname).await {
+                    tracing::warn!(
+                        post = post_id,
+                        comment = comment_fullname,
+                        "failed to distinguish/sticky reply: {error}"
+                    );
                 }
                 return;
             }
-            Ok(Err(ref error)) if !refreshed && is_unauthorized_roux_error(error) => {
-                if let Err(refresh_error) = refresh_session(auth, me).await {
-                    tracing::warn!(
-                        post = post_id,
-                        "failed to refresh Reddit session: {refresh_error}"
-                    );
+            Ok(Ok(PostCommentOutcome::Unauthorized)) if !refreshed => {
+                if let Err(error) = refresh_session(auth, me).await {
+                    tracing::warn!(post = post_id, "failed to refresh Reddit session: {error}");
                     return;
                 }
                 refreshed = true;
+            }
+            Ok(Ok(PostCommentOutcome::Unauthorized)) => {
+                tracing::warn!(
+                    post = post_id,
+                    "unauthorized after session refresh; giving up"
+                );
+                return;
             }
             Ok(Err(error)) => {
                 tracing::warn!(post = post_id, "failed to post reply: {error}");
@@ -780,9 +823,17 @@ mod tests {
         let mut info = sample_level();
         info.description = String::new();
         let block = PostReplyBlock(&info).to_string();
+        assert!(!block.contains("\n\n>"), "unexpected description block");
+    }
+
+    #[test]
+    fn reply_block_omits_description_when_whitespace_only() {
+        let mut info = sample_level();
+        info.description = "  \n  ".to_owned();
+        let block = PostReplyBlock(&info).to_string();
         assert!(
-            !block.contains("Description"),
-            "unexpected description line"
+            !block.contains("\n\n>"),
+            "unexpected whitespace-only description block"
         );
     }
 
@@ -800,7 +851,7 @@ mod tests {
     #[test]
     fn format_reply_contains_footer() {
         let reply = format_reply(&sample_level());
-        assert!(reply.contains("automated"), "footer missing from reply");
+        assert!(reply.contains("Automated"), "footer missing from reply");
         assert!(reply.contains("___"), "horizontal rule missing");
     }
 }

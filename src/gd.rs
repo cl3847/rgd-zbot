@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
 /// Base game song tracks, indexed by key 11 in the level data.
 const OFFICIAL_SONGS: &[&str] = &[
@@ -146,11 +146,18 @@ fn parse_creators(section: &str) -> HashMap<&str, &str> {
         .collect()
 }
 
-/// Decodes a URL-safe base64-encoded level description, returning an empty string on failure.
+/// Decodes a level description, accepting either URL-safe or standard base64.
 fn decode_description(raw: Option<&str>) -> String {
-    raw.and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .unwrap_or_default()
+    raw.and_then(|s| {
+        URL_SAFE_NO_PAD
+            .decode(s)
+            .ok()
+            .or_else(|| STANDARD.decode(s).ok())
+    })
+    .and_then(|bytes| String::from_utf8(bytes).ok())
+    .map(|text| text.trim().to_owned())
+    .filter(|text| !text.is_empty())
+    .unwrap_or_default()
 }
 
 /// Resolves the human-readable difficulty label from keys 9, 17, 25, and 43 in the level data.
