@@ -32,10 +32,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const MOD_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum number of post IDs retained in the seen-post deduplication cache.
 const SEEN_ID_CAPACITY: usize = 500;
-/// Number of recent bot comments inspected when locating the just-posted reply.
-const RECENT_COMMENT_LOOKUP_LIMIT: u32 = 10;
 /// Reddit superscript footer appended to every bot reply.
-const FOOTER: &str = "^this ^is ^an ^automated ^message. ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) | ^[source/contribute](https://github.com/cl3847/rgd-zbot/)";
+const FOOTER: &str = "^(automated) ^| by ^[Sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) ^| ^[source](https://github.com/cl3847/rgd-zbot/)";
 
 /// Credentials and metadata required to create or refresh an authenticated Reddit session.
 #[derive(Clone)]
@@ -97,10 +95,30 @@ enum FetchOutcome {
     Unauthorized,
 }
 
-/// Result of polling the bot's own recent comment listing.
-enum FetchOutcomeComments {
-    Success(Vec<roux::comment::CommentData>),
-    Unauthorized,
+/// Minimal response shape for Reddit's `/api/comment` endpoint.
+#[derive(Deserialize)]
+struct CommentApiResponse {
+    json: CommentApiJson,
+}
+
+#[derive(Deserialize)]
+struct CommentApiJson {
+    data: Option<CommentApiData>,
+}
+
+#[derive(Deserialize)]
+struct CommentApiData {
+    things: Vec<CommentApiThing>,
+}
+
+#[derive(Deserialize)]
+struct CommentApiThing {
+    data: CommentApiThingData,
+}
+
+#[derive(Deserialize)]
+struct CommentApiThingData {
+    name: Option<String>,
 }
 
 /// Compiled regexes for extracting a GD level ID from a post title; group 1 is the ID in both.
@@ -119,27 +137,36 @@ pub struct PostReplyBlock<'a>(pub &'a LevelInfo);
 impl fmt::Display for PostReplyBlock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let info = self.0;
-        writeln!(
+
+        write!(
             f,
-            "**Level:** *{}* by {} ({})  ",
+            "**{}** by {} ({})",
             info.name, info.creator_username, info.id
         )?;
+
         if !info.description.is_empty() {
             // Newlines in the description would break out of the blockquote; flatten them.
             let desc = info.description.replace('\n', " ");
-            write!(f, "**Description:**  \n> {desc}\n\n")?;
+            write!(f, "\n\n> {desc}")?;
         }
-        // Keep the legacy bot's `6* (Hard)` presentation for compatibility with existing output.
-        writeln!(f, "**Difficulty:** {}* ({})  ", info.stars, info.difficulty)?;
-        writeln!(
+
+        let likes = if info.likes < 0 {
+            format!("-{}", format_number(info.likes.unsigned_abs()))
+        } else {
+            format_number(info.likes as u64)
+        };
+
+        write!(
             f,
-            "**Stats:** {} downloads | {} likes | {}  ",
-            info.downloads, info.likes, info.length
-        )?;
-        writeln!(
-            f,
-            "**Song:** *{}* by {} ({})  ",
-            info.song_name, info.song_artist, info.song_id
+            "\n\n{} · {}★ · {} · {} downloads · {} likes  \n*{}* by {} ({})",
+            info.difficulty,
+            info.stars,
+            info.length,
+            format_number(info.downloads),
+            likes,
+            info.song_name,
+            info.song_artist,
+            info.song_id,
         )
     }
 }
@@ -154,6 +181,19 @@ pub fn find_level_id(title: &str) -> Option<String> {
 /// Assembles the full reply: the level block, a horizontal rule, and the bot footer.
 pub fn format_reply(info: &LevelInfo) -> String {
     format!("{}\n\n___\n\n{}", PostReplyBlock(info), FOOTER)
+}
+
+/// Formats a `u64` with thousands separators (e.g. `1234567` → `"1,234,567"`).
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
 }
 
 /// Truncates a response body to at most 200 characters and flattens newlines for log messages.
@@ -200,6 +240,13 @@ async fn refresh_session(auth: &RedditAuth, me: &mut Me) -> Result<()> {
     tracing::warn!("refreshing expired Reddit OAuth session");
     *me = auth.login().await?;
     Ok(())
+}
+
+/// Extracts the new comment's fullname from Reddit's `/api/comment` response body.
+async fn parse_comment_fullname(response: reqwest::Response) -> Option<String> {
+    let body = response.text().await.ok()?;
+    let parsed: CommentApiResponse = serde_json::from_str(&body).ok()?;
+    parsed.json.data?.things.into_iter().next()?.data.name
 }
 
 /// Fetches the most recent posts from the monitored subreddit via the OAuth listing endpoint.
@@ -264,114 +311,6 @@ async fn fetch_latest_submissions(me: &Me) -> Result<FetchOutcome> {
             .map(|item| item.data)
             .collect(),
     ))
-}
-
-/// Fetches the bot's most recent comments and returns them, or `Unauthorized` if the token expired.
-async fn fetch_recent_own_comments(me: &Me) -> Result<FetchOutcomeComments> {
-    let username = me
-        .config
-        .username
-        .as_deref()
-        .ok_or_else(|| anyhow!("logged-in Reddit username missing from session config"))?;
-    let url = format!(
-        "https://oauth.reddit.com/user/{username}/comments/.json?limit={RECENT_COMMENT_LOOKUP_LIMIT}"
-    );
-    let response = me
-        .client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("request failed: {e}"))?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("<missing>")
-        .to_owned();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| anyhow!("failed reading response body: {e}"))?;
-
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Ok(FetchOutcomeComments::Unauthorized);
-    }
-
-    if !status.is_success() {
-        bail!(
-            "status={} content_type={} body_prefix={:?}",
-            status,
-            content_type,
-            response_preview(&body)
-        );
-    }
-
-    if !content_type.contains("json") {
-        bail!(
-            "unexpected content_type={} body_prefix={:?}",
-            content_type,
-            response_preview(&body)
-        );
-    }
-
-    let comments: roux::Comments = serde_json::from_str(&body).map_err(|e| {
-        anyhow!(
-            "failed to decode Reddit comments listing: {e}; status={}; content_type={}; body_prefix={:?}",
-            status,
-            content_type,
-            response_preview(&body)
-        )
-    })?;
-
-    Ok(FetchOutcomeComments::Success(
-        comments
-            .data
-            .children
-            .into_iter()
-            .map(|item| item.data)
-            .collect(),
-    ))
-}
-
-/// Locates the most recent bot comment on the given submission, or `None` if not found.
-async fn find_reply_fullname(
-    auth: &RedditAuth,
-    me: &mut Me,
-    reply: &str,
-    submission_fullname: &str,
-) -> Result<Option<String>> {
-    let mut refreshed = false;
-
-    loop {
-        let comments = match timeout(MOD_ACTION_TIMEOUT, fetch_recent_own_comments(me)).await {
-            Ok(Ok(FetchOutcomeComments::Success(comments))) => comments,
-            Ok(Ok(FetchOutcomeComments::Unauthorized)) if !refreshed => {
-                refresh_session(auth, me).await?;
-                refreshed = true;
-                continue;
-            }
-            Ok(Ok(FetchOutcomeComments::Unauthorized)) => {
-                bail!("unauthorized after refreshing Reddit session")
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => bail!(
-                "timed out fetching recent bot comments after {}s",
-                MOD_ACTION_TIMEOUT.as_secs()
-            ),
-        };
-
-        return Ok(comments.into_iter().find_map(|comment| {
-            if comment.link_id.as_deref() == Some(submission_fullname)
-                && comment.parent_id.as_deref() == Some(submission_fullname)
-                && comment.body.as_deref() == Some(reply)
-            {
-                comment.name
-            } else {
-                None
-            }
-        }));
-    }
 }
 
 /// Distinguishes and stickies a moderator comment, refreshing the OAuth session once if needed.
@@ -447,10 +386,10 @@ async fn post_reply(
     loop {
         let result = timeout(REPLY_TIMEOUT, me.comment(reply, submission_fullname)).await;
         match result {
-            Ok(Ok(_)) => {
+            Ok(Ok(response)) => {
                 tracing::info!(post = post_id, level_id, "replied");
-                match find_reply_fullname(auth, me, reply, submission_fullname).await {
-                    Ok(Some(comment_fullname)) => {
+                match parse_comment_fullname(response).await {
+                    Some(comment_fullname) => {
                         if let Err(error) = sticky_comment(auth, me, &comment_fullname).await {
                             tracing::warn!(
                                 post = post_id,
@@ -459,16 +398,10 @@ async fn post_reply(
                             );
                         }
                     }
-                    Ok(None) => {
+                    None => {
                         tracing::warn!(
                             post = post_id,
-                            "posted reply but could not locate comment to distinguish/sticky"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            post = post_id,
-                            "posted reply but failed locating comment for moderation: {error}"
+                            "could not extract comment fullname from reply response; skipping distinguish/sticky"
                         );
                     }
                 }
@@ -819,24 +752,27 @@ mod tests {
     #[test]
     fn reply_block_contains_level_name() {
         let block = PostReplyBlock(&sample_level()).to_string();
-        assert!(
-            block.contains("*Test Level*"),
-            "expected italicised level name"
-        );
+        assert!(block.contains("**Test Level**"), "expected bold level name");
     }
 
     #[test]
-    fn reply_block_difficulty_matches_legacy_format() {
+    fn reply_block_stats_line_format() {
         let block = PostReplyBlock(&sample_level()).to_string();
+        assert!(block.contains("Hard"), "expected difficulty label");
         assert!(
-            block.contains("6*"),
-            "expected star count with trailing asterisk"
+            block.contains("6★"),
+            "expected star count with unicode star"
         );
+        assert!(block.contains("Long"), "expected length");
         assert!(
-            !block.contains("*6*"),
-            "did not expect italicised star count"
+            block.contains("1,000 downloads"),
+            "expected formatted download count"
         );
-        assert!(block.contains("(Hard)"), "expected difficulty in parens");
+        assert!(block.contains("50 likes"), "expected like count");
+        assert!(
+            block.contains("Some Artist (999999)"),
+            "expected artist with song ID in parens"
+        );
     }
 
     #[test]
