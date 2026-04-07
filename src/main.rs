@@ -2,9 +2,12 @@ mod gd;
 mod reddit;
 
 use anyhow::Context as _;
+use reddit::RedditAuth;
 
-const REDDIT_USER_AGENT: &str = "nodejs:rgd-zbot:v2.0.0 (by /u/Sayajiaji)";
+/// OAuth user-agent string sent with every Reddit API request.
+const REDDIT_USER_AGENT: &str = "rust:rgd-zbot:v2.0.0 (by /u/Sayajiaji)";
 
+/// Loads credentials from the environment, authenticates with Reddit, and starts the polling loop.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -16,13 +19,15 @@ async fn main() -> anyhow::Result<()> {
     let username = std::env::var("REDDIT_USERNAME").context("REDDIT_USERNAME not set")?;
     let password = std::env::var("REDDIT_PASSWORD").context("REDDIT_PASSWORD not set")?;
 
-    let me = roux::Reddit::new(REDDIT_USER_AGENT, &client_id, &client_secret)
-        .username(&username)
-        .password(&password)
-        .login()
-        .await?;
+    let auth = RedditAuth {
+        user_agent: REDDIT_USER_AGENT.to_owned(),
+        client_id,
+        client_secret,
+        username,
+        password,
+    };
 
-    reddit::run(me).await?;
+    reddit::run(auth).await?;
 
     Ok(())
 }

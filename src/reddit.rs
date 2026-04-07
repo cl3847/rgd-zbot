@@ -1,29 +1,79 @@
-//! Reddit bot logic: submission streaming, ID extraction, and reply posting.
+//! Reddit bot logic: authenticated subreddit polling, ID extraction, and reply posting.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use roux::Me;
+use roux::response::BasicListing;
 use roux::submission::SubmissionData;
-use roux::subreddit::Subreddit;
-use tokio::time::{MissedTickBehavior, interval, timeout};
+use roux::util::RouxError;
+use tokio::time::{sleep, timeout};
 
 use crate::gd::{LevelInfo, search_level};
 
+/// Subreddit the bot monitors for new posts.
 const SUBREDDIT: &str = "geometrydash";
+/// Four seconds stays comfortably under Reddit's 60 req/min OAuth guidance while still feeling realtime.
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
+/// Posts older than this many seconds are ignored to avoid replying to stale content.
 const MAX_AGE_SECS: u64 = 60;
+/// Maximum number of posts to fetch per poll request.
 const LISTING_LIMIT: u32 = 100;
+/// Timeout applied to each Reddit listing HTTP request.
 const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout applied to each Boomlings level lookup.
 const LEVEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout applied to each Reddit comment submission.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout applied to locating and moderating a newly posted bot comment.
+const MOD_ACTION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum number of post IDs retained in the seen-post deduplication cache.
+const SEEN_ID_CAPACITY: usize = 500;
+/// Number of recent bot comments inspected when locating the just-posted reply.
+const RECENT_COMMENT_LOOKUP_LIMIT: u32 = 10;
+/// Reddit superscript footer appended to every bot reply.
 const FOOTER: &str = "^this ^is ^an ^automated ^message. ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) | ^[source/contribute](https://github.com/cl3847/rgd-zbot/)";
 
-// Both patterns capture the level ID in group 1.
+/// Credentials and metadata required to create or refresh an authenticated Reddit session.
+#[derive(Clone)]
+pub struct RedditAuth {
+    pub user_agent: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub username: String,
+    pub password: String,
+}
+
+impl RedditAuth {
+    /// Logs in to Reddit and returns a fresh OAuth session.
+    pub async fn login(&self) -> Result<Me> {
+        Ok(
+            roux::Reddit::new(&self.user_agent, &self.client_id, &self.client_secret)
+                .username(&self.username)
+                .password(&self.password)
+                .login()
+                .await?,
+        )
+    }
+}
+
+/// Result of polling the latest subreddit listing.
+enum FetchOutcome {
+    Success(Vec<SubmissionData>),
+    Unauthorized,
+}
+
+/// Result of polling the bot's own recent comment listing.
+enum FetchOutcomeComments {
+    Success(Vec<roux::comment::CommentData>),
+    Unauthorized,
+}
+
+/// Compiled regexes for extracting a GD level ID from a post title; group 1 is the ID in both.
 static ID_PATTERNS: LazyLock<[Regex; 2]> = LazyLock::new(|| {
     [
         // "id 12345678", "ID: 12345678", "id=12345678", "(id 12345678)" etc.
@@ -32,13 +82,6 @@ static ID_PATTERNS: LazyLock<[Regex; 2]> = LazyLock::new(|| {
         Regex::new(r"(?:^| )\\?[\[\(]([0-9]{6,10})\\?[\]\)](?:$| )").unwrap(),
     ]
 });
-
-/// Scans a post title for a GD level ID. Returns the first match, or `None`.
-pub fn find_level_id(title: &str) -> Option<String> {
-    ID_PATTERNS
-        .iter()
-        .find_map(|re| re.captures(title)?.get(1).map(|m| m.as_str().to_owned()))
-}
 
 /// Reddit markdown block for a single level.
 pub struct PostReplyBlock<'a>(pub &'a LevelInfo);
@@ -56,6 +99,7 @@ impl fmt::Display for PostReplyBlock<'_> {
             let desc = info.description.replace('\n', " ");
             write!(f, "**Description:**  \n> {desc}\n\n")?;
         }
+        // Keep the legacy bot's `6* (Hard)` presentation for compatibility with existing output.
         writeln!(f, "**Difficulty:** {}* ({})  ", info.stars, info.difficulty)?;
         writeln!(
             f,
@@ -70,12 +114,361 @@ impl fmt::Display for PostReplyBlock<'_> {
     }
 }
 
+/// Scans a post title for a GD level ID. Returns the first match, or `None`.
+pub fn find_level_id(title: &str) -> Option<String> {
+    ID_PATTERNS
+        .iter()
+        .find_map(|re| re.captures(title)?.get(1).map(|m| m.as_str().to_owned()))
+}
+
 /// Assembles the full reply: the level block, a horizontal rule, and the bot footer.
 pub fn format_reply(info: &LevelInfo) -> String {
     format!("{}\n\n___\n\n{}", PostReplyBlock(info), FOOTER)
 }
 
-async fn handle_submission(me: &Me, submission: SubmissionData) {
+/// Truncates a response body to at most 200 characters and flattens newlines for log messages.
+fn response_preview(body: &str) -> String {
+    const LIMIT: usize = 200;
+    body.chars()
+        .take(LIMIT)
+        .collect::<String>()
+        .replace(['\n', '\r'], " ")
+}
+
+/// Returns an exponentially stepped backoff duration for a given consecutive failure count.
+fn failure_backoff_delay(failure_streak: u32) -> Duration {
+    const STEPS_SECS: &[u64] = &[4, 8, 16, 32, 60];
+    let idx = failure_streak.saturating_sub(1) as usize;
+    Duration::from_secs(STEPS_SECS[idx.min(STEPS_SECS.len() - 1)])
+}
+
+/// Adds a post ID to the seen-set, evicting the oldest entry when at capacity. Returns `true` if new.
+fn remember_seen(id: String, seen_ids: &mut HashSet<String>, seen_order: &mut VecDeque<String>) -> bool {
+    if !seen_ids.insert(id.clone()) {
+        return false;
+    }
+    seen_order.push_back(id);
+    if seen_order.len() > SEEN_ID_CAPACITY {
+        if let Some(evicted) = seen_order.pop_front() {
+            seen_ids.remove(&evicted);
+        }
+    }
+    true
+}
+
+/// Returns true when a roux error is a 401 status response.
+fn is_unauthorized_roux_error(error: &RouxError) -> bool {
+    matches!(error, RouxError::Status(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+/// Replaces the current Reddit session with a freshly authenticated one.
+async fn refresh_session(auth: &RedditAuth, me: &mut Me) -> Result<()> {
+    tracing::warn!("refreshing expired Reddit OAuth session");
+    *me = auth.login().await?;
+    Ok(())
+}
+
+/// Fetches the most recent posts from the monitored subreddit via the OAuth listing endpoint.
+async fn fetch_latest_submissions(me: &Me) -> Result<FetchOutcome> {
+    let url = format!(
+        "{}?limit={LISTING_LIMIT}",
+        roux::util::url::build_oauth(&format!("r/{SUBREDDIT}/new"))
+    );
+    let response = me
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("request failed: {e}"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_owned();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow!("failed reading response body: {e}"))?;
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(FetchOutcome::Unauthorized);
+    }
+
+    if !status.is_success() {
+        bail!(
+            "status={} content_type={} body_prefix={:?}",
+            status,
+            content_type,
+            response_preview(&body)
+        );
+    }
+
+    if !content_type.contains("json") {
+        bail!(
+            "unexpected content_type={} body_prefix={:?}",
+            content_type,
+            response_preview(&body)
+        );
+    }
+
+    let listing: BasicListing<SubmissionData> = serde_json::from_str(&body).map_err(|e| {
+        anyhow!(
+            "failed to decode Reddit listing: {e}; status={}; content_type={}; body_prefix={:?}",
+            status,
+            content_type,
+            response_preview(&body)
+        )
+    })?;
+
+    Ok(FetchOutcome::Success(
+        listing
+            .data
+            .children
+            .into_iter()
+            .map(|item| item.data)
+            .collect(),
+    ))
+}
+
+/// Fetches the bot's most recent comments and returns them, or `Unauthorized` if the token expired.
+async fn fetch_recent_own_comments(me: &Me) -> Result<FetchOutcomeComments> {
+    let username = me
+        .config
+        .username
+        .as_deref()
+        .ok_or_else(|| anyhow!("logged-in Reddit username missing from session config"))?;
+    let url = format!(
+        "https://oauth.reddit.com/user/{username}/comments/.json?limit={RECENT_COMMENT_LOOKUP_LIMIT}"
+    );
+    let response = me
+        .client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("request failed: {e}"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>")
+        .to_owned();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| anyhow!("failed reading response body: {e}"))?;
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(FetchOutcomeComments::Unauthorized);
+    }
+
+    if !status.is_success() {
+        bail!(
+            "status={} content_type={} body_prefix={:?}",
+            status,
+            content_type,
+            response_preview(&body)
+        );
+    }
+
+    if !content_type.contains("json") {
+        bail!(
+            "unexpected content_type={} body_prefix={:?}",
+            content_type,
+            response_preview(&body)
+        );
+    }
+
+    let comments: roux::Comments = serde_json::from_str(&body).map_err(|e| {
+        anyhow!(
+            "failed to decode Reddit comments listing: {e}; status={}; content_type={}; body_prefix={:?}",
+            status,
+            content_type,
+            response_preview(&body)
+        )
+    })?;
+
+    Ok(FetchOutcomeComments::Success(
+        comments
+            .data
+            .children
+            .into_iter()
+            .map(|item| item.data)
+            .collect(),
+    ))
+}
+
+/// Locates the most recent bot comment on the given submission, or `None` if not found.
+async fn find_reply_fullname(
+    auth: &RedditAuth,
+    me: &mut Me,
+    reply: &str,
+    submission_fullname: &str,
+) -> Result<Option<String>> {
+    let mut refreshed = false;
+
+    loop {
+        let comments = match timeout(MOD_ACTION_TIMEOUT, fetch_recent_own_comments(me)).await {
+            Ok(Ok(FetchOutcomeComments::Success(comments))) => comments,
+            Ok(Ok(FetchOutcomeComments::Unauthorized)) if !refreshed => {
+                refresh_session(auth, me).await?;
+                refreshed = true;
+                continue;
+            }
+            Ok(Ok(FetchOutcomeComments::Unauthorized)) => {
+                bail!("unauthorized after refreshing Reddit session")
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => bail!(
+                "timed out fetching recent bot comments after {}s",
+                MOD_ACTION_TIMEOUT.as_secs()
+            ),
+        };
+
+        return Ok(comments.into_iter().find_map(|comment| {
+            if comment.link_id.as_deref() == Some(submission_fullname)
+                && comment.parent_id.as_deref() == Some(submission_fullname)
+                && comment.body.as_deref() == Some(reply)
+            {
+                comment.name
+            } else {
+                None
+            }
+        }));
+    }
+}
+
+/// Distinguishes and stickies a moderator comment, refreshing the OAuth session once if needed.
+async fn sticky_comment(auth: &RedditAuth, me: &mut Me, comment_fullname: &str) -> Result<()> {
+    let mut refreshed = false;
+
+    loop {
+        let form = [
+            ("api_type", "json"),
+            ("how", "yes"),
+            ("sticky", "true"),
+            ("id", comment_fullname),
+        ];
+        let result = timeout(
+            MOD_ACTION_TIMEOUT,
+            me.client
+                .post("https://oauth.reddit.com/api/distinguish")
+                .form(&form)
+                .send(),
+        )
+        .await;
+
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(anyhow!("request failed: {error}")),
+            Err(_) => bail!(
+                "timed out distinguishing comment after {}s",
+                MOD_ACTION_TIMEOUT.as_secs()
+            ),
+        };
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+            refresh_session(auth, me).await?;
+            refreshed = true;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<missing>")
+                .to_owned();
+            let body = response
+                .text()
+                .await
+                .map_err(|e| anyhow!("failed reading response body: {e}"))?;
+            bail!(
+                "status={} content_type={} body_prefix={:?}",
+                status,
+                content_type,
+                response_preview(&body)
+            );
+        }
+
+        return Ok(());
+    }
+}
+
+/// Posts a reply to a submission, then distinguishes and stickies the resulting comment.
+async fn post_reply(
+    auth: &RedditAuth,
+    me: &mut Me,
+    reply: &str,
+    submission_fullname: &str,
+    post_id: &str,
+    level_id: &str,
+) {
+    let mut refreshed = false;
+
+    loop {
+        let result = timeout(REPLY_TIMEOUT, me.comment(reply, submission_fullname)).await;
+        match result {
+            Ok(Ok(_)) => {
+                tracing::info!(post = post_id, level_id, "replied");
+                match find_reply_fullname(auth, me, reply, submission_fullname).await {
+                    Ok(Some(comment_fullname)) => {
+                        if let Err(error) = sticky_comment(auth, me, &comment_fullname).await {
+                            tracing::warn!(
+                                post = post_id,
+                                comment = comment_fullname,
+                                "failed to distinguish/sticky reply: {error}"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            post = post_id,
+                            "posted reply but could not locate comment to distinguish/sticky"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            post = post_id,
+                            "posted reply but failed locating comment for moderation: {error}"
+                        );
+                    }
+                }
+                return;
+            }
+            Ok(Err(ref error)) if !refreshed && is_unauthorized_roux_error(error) => {
+                if let Err(refresh_error) = refresh_session(auth, me).await {
+                    tracing::warn!(
+                        post = post_id,
+                        "failed to refresh Reddit session: {refresh_error}"
+                    );
+                    return;
+                }
+                refreshed = true;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(post = post_id, "failed to post reply: {error}");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    post = post_id,
+                    level_id,
+                    timeout_secs = REPLY_TIMEOUT.as_secs(),
+                    "timed out posting reply"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Processes a single Reddit submission: extracts a level ID, looks it up, and posts a reply.
+async fn handle_submission(auth: &RedditAuth, me: &mut Me, submission: SubmissionData) {
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(_) => {
@@ -83,7 +476,17 @@ async fn handle_submission(me: &Me, submission: SubmissionData) {
             return;
         }
     };
-    let created_secs = submission.created_utc.max(0.0) as u64;
+
+    if submission.created_utc < 0.0 {
+        tracing::warn!(
+            post = %submission.id,
+            created_utc = submission.created_utc,
+            "submission had negative created_utc"
+        );
+        return;
+    }
+
+    let created_secs = submission.created_utc as u64;
     let age_secs = now.saturating_sub(created_secs);
     let too_old = age_secs > MAX_AGE_SECS;
     let is_self = me.config.username.as_deref() == Some(submission.author.as_str());
@@ -125,27 +528,8 @@ async fn handle_submission(me: &Me, submission: SubmissionData) {
 
     match level {
         Ok(Some(info)) => {
-            match timeout(
-                REPLY_TIMEOUT,
-                me.comment(&format_reply(&info), &submission.name),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    tracing::info!(post = %submission.id, level_id = %id, "replied");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(post = %submission.id, "failed to post reply: {e}");
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        post = %submission.id,
-                        level_id = %id,
-                        timeout_secs = REPLY_TIMEOUT.as_secs(),
-                        "timed out posting reply"
-                    );
-                }
-            }
+            let reply = format_reply(&info);
+            post_reply(auth, me, &reply, &submission.name, &submission.id, &id).await;
         }
         Ok(None) => tracing::info!(post = %submission.id, level_id = %id, "level not found"),
         Err(e) => tracing::warn!(post = %submission.id, level_id = %id, "API error: {e}"),
@@ -153,11 +537,11 @@ async fn handle_submission(me: &Me, submission: SubmissionData) {
 }
 
 /// Polls r/geometrydash and replies to posts containing a level ID.
-pub async fn run(me: Me) -> Result<()> {
-    let subreddit = Subreddit::new_oauth(SUBREDDIT, &me.client);
+pub async fn run(auth: RedditAuth) -> Result<()> {
+    let mut me = auth.login().await?;
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut ticker = interval(POLL_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut seen_order: VecDeque<String> = VecDeque::with_capacity(SEEN_ID_CAPACITY);
+    let mut failure_streak = 0_u32;
 
     tracing::info!(
         poll_interval_secs = POLL_INTERVAL.as_secs(),
@@ -167,55 +551,65 @@ pub async fn run(me: Me) -> Result<()> {
     );
 
     loop {
-        ticker.tick().await;
-
-        let latest =
-            match timeout(POLL_REQUEST_TIMEOUT, subreddit.latest(LISTING_LIMIT, None)).await {
-                Ok(Ok(listing)) => listing,
+        let latest_submissions =
+            match timeout(POLL_REQUEST_TIMEOUT, fetch_latest_submissions(&me)).await {
+                Ok(Ok(FetchOutcome::Success(submissions))) => {
+                    failure_streak = 0;
+                    submissions
+                }
+                Ok(Ok(FetchOutcome::Unauthorized)) => {
+                    refresh_session(&auth, &mut me).await?;
+                    failure_streak = 0;
+                    continue;
+                }
                 Ok(Err(e)) => {
-                    tracing::warn!("failed to fetch latest submissions: {e}");
+                    failure_streak = failure_streak.saturating_add(1);
+                    let backoff = failure_backoff_delay(failure_streak);
+                    tracing::warn!(
+                        failure_streak,
+                        backoff_secs = backoff.as_secs(),
+                        "failed to fetch latest submissions: {e}"
+                    );
+                    sleep(backoff).await;
                     continue;
                 }
                 Err(_) => {
+                    failure_streak = failure_streak.saturating_add(1);
+                    let backoff = failure_backoff_delay(failure_streak);
                     tracing::warn!(
+                        failure_streak,
                         timeout_secs = POLL_REQUEST_TIMEOUT.as_secs(),
+                        backoff_secs = backoff.as_secs(),
                         "timed out fetching latest submissions"
                     );
+                    sleep(backoff).await;
                     continue;
                 }
             };
 
-        let latest_submissions: Vec<SubmissionData> = latest
-            .data
-            .children
-            .into_iter()
-            .map(|item| item.data)
-            .collect();
-        let mut latest_ids: HashSet<String> = HashSet::with_capacity(latest_submissions.len());
         let mut num_new = 0;
 
         for submission in latest_submissions {
             let id = submission.id.clone();
-            latest_ids.insert(id.clone());
-            if !seen_ids.contains(&id) {
+            if remember_seen(id, &mut seen_ids, &mut seen_order) {
                 num_new += 1;
-                handle_submission(&me, submission).await;
+                handle_submission(&auth, &mut me, submission).await;
             }
         }
 
         tracing::debug!(
             new_submissions = num_new,
-            fetched = latest_ids.len(),
+            seen_cache_size = seen_ids.len(),
             "finished Reddit poll"
         );
-        if num_new == latest_ids.len() && !seen_ids.is_empty() {
+        if num_new == LISTING_LIMIT as usize {
             tracing::warn!(
-                fetched = latest_ids.len(),
-                "all fetched submissions were new; consider a shorter poll interval"
+                listing_limit = LISTING_LIMIT,
+                "every fetched submission was new; consider a shorter poll interval"
             );
         }
 
-        seen_ids = latest_ids;
+        sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -227,12 +621,8 @@ mod tests {
         find_level_id(title).is_some()
     }
 
-    fn extracts(title: &str) -> &str {
-        Box::leak(
-            find_level_id(title)
-                .expect("expected a match")
-                .into_boxed_str(),
-        )
+    fn extracts(title: &str) -> String {
+        find_level_id(title).expect("expected a match")
     }
 
     // ── pattern 1: explicit "id" keyword ─────────────────────────────────────

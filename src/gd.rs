@@ -8,7 +8,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-// Base game song tracks, indexed by key 11 in the level data.
+/// Base game song tracks, indexed by key 11 in the level data.
 const OFFICIAL_SONGS: &[&str] = &[
     "Stereo Madness",
     "Back on Track",
@@ -34,6 +34,7 @@ const OFFICIAL_SONGS: &[&str] = &[
     "Dash",
 ];
 
+/// Shared HTTP client for all Boomlings API requests; initialized once on first use.
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -86,6 +87,16 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
         anyhow::bail!("unexpected response from Boomlings API");
     }
 
+    let actual_id = kv.get("1").copied().unwrap_or_default();
+    if actual_id != id {
+        tracing::info!(
+            requested_id = id,
+            actual_id,
+            "Boomlings returned a different level"
+        );
+        return Ok(None);
+    }
+
     // Section 1 maps playerID → username. Key 6 in the level data holds the creator's playerID,
     // not their accountID — the two are different and only playerID appears in this response.
     let creators = parse_creators(sections.get(1).copied().unwrap_or(""));
@@ -98,7 +109,7 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
     let (song_name, song_artist, song_id) = resolve_song(&kv, sections.get(2).copied());
 
     Ok(Some(LevelInfo {
-        id: kv.get("1").and_then(|s| s.parse().ok()).unwrap_or(0),
+        id: actual_id.parse().unwrap_or(0),
         name: kv.get("2").copied().unwrap_or("").to_owned(),
         description: decode_description(kv.get("3").copied()),
         creator_username,
@@ -113,7 +124,7 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
     }))
 }
 
-// Section 0 is a flat stride-2 key:value:key:value:... sequence.
+/// Parses a flat stride-2 `key:value:key:value:...` section into a map.
 fn parse_kv(section: &str) -> HashMap<&str, &str> {
     section
         .split(':')
@@ -123,7 +134,7 @@ fn parse_kv(section: &str) -> HashMap<&str, &str> {
         .collect()
 }
 
-// Section 1 entries are `playerID:username:accountID`.
+/// Parses the creators section (`playerID:username:accountID|...`) into a playerID-to-username map.
 fn parse_creators(section: &str) -> HashMap<&str, &str> {
     section
         .split('|')
@@ -135,15 +146,14 @@ fn parse_creators(section: &str) -> HashMap<&str, &str> {
         .collect()
 }
 
-// Descriptions are URL-safe base64 with no padding.
+/// Decodes a URL-safe base64-encoded level description, returning an empty string on failure.
 fn decode_description(raw: Option<&str>) -> String {
     raw.and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .unwrap_or_default()
 }
 
-// Difficulty spans three keys: key 17 (is demon), key 25 (is auto), and key 9 (the
-// denominator: 10/20/30/40/50 for Easy–Insane). For demons, key 43 gives the sub-type. Hard Demon is the implicit default.
+/// Resolves the human-readable difficulty label from keys 9, 17, 25, and 43 in the level data.
 fn resolve_difficulty(kv: &HashMap<&str, &str>) -> String {
     if kv.get("17").copied() == Some("1") {
         return match kv.get("43").copied() {
@@ -169,7 +179,7 @@ fn resolve_difficulty(kv: &HashMap<&str, &str>) -> String {
     .to_owned()
 }
 
-// Length is key 15.
+/// Maps the numeric length key (key 15) to its human-readable label.
 fn resolve_length(kv: &HashMap<&str, &str>) -> String {
     match kv.get("15").copied() {
         Some("0") => "Tiny",
@@ -183,7 +193,7 @@ fn resolve_length(kv: &HashMap<&str, &str>) -> String {
     .to_owned()
 }
 
-// Key 35 holds the Newgrounds song ID. Absent or "0" both mean the song is from the base game.
+/// Returns `(name, artist, id)` for the level's song, resolving official tracks or custom Newgrounds songs.
 fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String, String, u32) {
     let Some(target_id) = kv.get("35").copied().filter(|&id| id != "0") else {
         let idx = kv
