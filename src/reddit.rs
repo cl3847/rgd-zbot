@@ -87,6 +87,7 @@ pub async fn run(me: Me) -> Result<()> {
         let submission = match result {
             Ok(sub) => sub,
             Err(e) => {
+                println!("STREAM: error while polling Reddit: {e}");
                 tracing::warn!("stream error: {e}");
                 continue;
             }
@@ -99,10 +100,36 @@ pub async fn run(me: Me) -> Result<()> {
                 continue;
             }
         };
-        let too_old = submission.created_utc.max(0.0) as u64 + MAX_AGE_SECS < now;
+        let created_secs = submission.created_utc.max(0.0) as u64;
+        let age_secs = now.saturating_sub(created_secs);
+        let too_old = age_secs > MAX_AGE_SECS;
         let is_self = me.config.username.as_deref() == Some(submission.author.as_str());
+        let already_seen = seen.contains(&submission.id);
 
-        if seen.contains(&submission.id) || too_old || is_self {
+        println!(
+            "STREAM: post={} age={}s seen={} self={} title={:?}",
+            submission.id, age_secs, already_seen, is_self, submission.title
+        );
+
+        if already_seen {
+            println!(
+                "STREAM: skipping post={} because it was already seen",
+                submission.id
+            );
+            continue;
+        }
+        if too_old {
+            println!(
+                "STREAM: skipping post={} because it is too old ({}s > {}s)",
+                submission.id, age_secs, MAX_AGE_SECS
+            );
+            continue;
+        }
+        if is_self {
+            println!(
+                "STREAM: skipping post={} because author matches the bot account",
+                submission.id
+            );
             continue;
         }
         // Marked seen before the API call. A transient failure will not be retried,
@@ -111,21 +138,40 @@ pub async fn run(me: Me) -> Result<()> {
         seen.insert(submission.id.clone());
 
         let Some(id) = find_level_id(&submission.title) else {
+            println!("STREAM: no level ID match for post={}", submission.id);
             continue;
         };
 
+        println!("STREAM: matched level ID {id} for post={}", submission.id);
         tracing::info!(post = %submission.id, level_id = %id, "found level ID");
 
         match search_level(&id).await {
             Ok(Some(info)) => {
                 if let Err(e) = me.comment(&format_reply(&info), &submission.name).await {
+                    println!(
+                        "STREAM: failed to reply to post={} error={e}",
+                        submission.id
+                    );
                     tracing::warn!(post = %submission.id, "failed to post reply: {e}");
                 } else {
+                    println!("STREAM: replied to post={} level_id={id}", submission.id);
                     tracing::info!(post = %submission.id, level_id = %id, "replied");
                 }
             }
-            Ok(None) => tracing::info!(post = %submission.id, level_id = %id, "level not found"),
-            Err(e) => tracing::warn!(post = %submission.id, level_id = %id, "API error: {e}"),
+            Ok(None) => {
+                println!(
+                    "STREAM: level lookup returned no result for post={} level_id={id}",
+                    submission.id
+                );
+                tracing::info!(post = %submission.id, level_id = %id, "level not found");
+            }
+            Err(e) => {
+                println!(
+                    "STREAM: level lookup failed for post={} level_id={} error={e}",
+                    submission.id, id
+                );
+                tracing::warn!(post = %submission.id, level_id = %id, "API error: {e}");
+            }
         }
     }
 
