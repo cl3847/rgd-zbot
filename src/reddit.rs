@@ -143,15 +143,19 @@ fn failure_backoff_delay(failure_streak: u32) -> Duration {
 }
 
 /// Adds a post ID to the seen-set, evicting the oldest entry when at capacity. Returns `true` if new.
-fn remember_seen(id: String, seen_ids: &mut HashSet<String>, seen_order: &mut VecDeque<String>) -> bool {
+fn remember_seen(
+    id: String,
+    seen_ids: &mut HashSet<String>,
+    seen_order: &mut VecDeque<String>,
+) -> bool {
     if !seen_ids.insert(id.clone()) {
         return false;
     }
     seen_order.push_back(id);
-    if seen_order.len() > SEEN_ID_CAPACITY {
-        if let Some(evicted) = seen_order.pop_front() {
-            seen_ids.remove(&evicted);
-        }
+    if seen_order.len() > SEEN_ID_CAPACITY
+        && let Some(evicted) = seen_order.pop_front()
+    {
+        seen_ids.remove(&evicted);
     }
     true
 }
