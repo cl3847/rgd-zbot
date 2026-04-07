@@ -11,6 +11,7 @@ use regex::Regex;
 use roux::Me;
 use roux::subreddit::Subreddit;
 use roux_stream::stream_submissions;
+use tokio::time::timeout;
 use tokio_retry::strategy::ExponentialBackoff;
 
 use crate::gd::{LevelInfo, search_level};
@@ -18,6 +19,8 @@ use crate::gd::{LevelInfo, search_level};
 const SUBREDDIT: &str = "geometrydash";
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const MAX_AGE_SECS: u64 = 60;
+const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const FOOTER: &str = "^this ^is ^an ^automated ^message. ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) | ^[source/contribute](https://github.com/cl3847/rgd-zbot/)";
 
 // Both patterns capture the level ID in group 1.
@@ -76,14 +79,73 @@ pub fn format_reply(info: &LevelInfo) -> String {
 /// the underlying stream terminates.
 pub async fn run(me: Me) -> Result<()> {
     let subreddit = Subreddit::new(SUBREDDIT);
+    let oauth_subreddit = Subreddit::new_oauth(SUBREDDIT, &me.client);
     let retry = ExponentialBackoff::from_millis(5000).take(3);
+
+    println!(
+        "STARTUP: probing r/{SUBREDDIT} latest feed with public client (timeout={}s)",
+        STREAM_REQUEST_TIMEOUT.as_secs()
+    );
+    match timeout(STREAM_REQUEST_TIMEOUT, subreddit.latest(5, None)).await {
+        Ok(Ok(listing)) => println!(
+            "STARTUP: public latest ok, received {} submissions",
+            listing.data.children.len()
+        ),
+        Ok(Err(e)) => println!("STARTUP: public latest error: {e}"),
+        Err(_) => println!("STARTUP: public latest timed out"),
+    }
+
+    println!(
+        "STARTUP: probing r/{SUBREDDIT} latest feed with OAuth client (timeout={}s)",
+        STREAM_REQUEST_TIMEOUT.as_secs()
+    );
+    match timeout(STREAM_REQUEST_TIMEOUT, oauth_subreddit.latest(5, None)).await {
+        Ok(Ok(listing)) => println!(
+            "STARTUP: OAuth latest ok, received {} submissions",
+            listing.data.children.len()
+        ),
+        Ok(Err(e)) => println!("STARTUP: OAuth latest error: {e}"),
+        Err(_) => println!("STARTUP: OAuth latest timed out"),
+    }
+
     // _handle keeps the background polling task alive; dropping it stops the stream.
-    let (mut stream, _handle) = stream_submissions(&subreddit, POLL_INTERVAL, retry, None);
+    let (mut stream, _handle) = stream_submissions(
+        &subreddit,
+        POLL_INTERVAL,
+        retry,
+        Some(STREAM_REQUEST_TIMEOUT),
+    );
     let mut seen: HashSet<String> = HashSet::new();
 
     tracing::info!("monitoring r/{SUBREDDIT}");
+    println!(
+        "STREAM: started r/{SUBREDDIT} poller interval={}s request_timeout={}s",
+        POLL_INTERVAL.as_secs(),
+        STREAM_REQUEST_TIMEOUT.as_secs()
+    );
 
-    while let Some(result) = stream.next().await {
+    loop {
+        println!(
+            "STREAM: waiting up to {}s for next event",
+            STREAM_IDLE_LOG_INTERVAL.as_secs()
+        );
+        let next_result = match timeout(STREAM_IDLE_LOG_INTERVAL, stream.next()).await {
+            Ok(result) => result,
+            Err(_) => {
+                println!(
+                    "STREAM: no submissions or stream errors received in the last {}s",
+                    STREAM_IDLE_LOG_INTERVAL.as_secs()
+                );
+                continue;
+            }
+        };
+
+        let Some(result) = next_result else {
+            println!("STREAM: stream terminated unexpectedly");
+            tracing::warn!("submission stream terminated unexpectedly");
+            break;
+        };
+
         let submission = match result {
             Ok(sub) => sub,
             Err(e) => {
