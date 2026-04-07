@@ -8,9 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use roux::Me;
-use roux::response::BasicListing;
-use roux::submission::SubmissionData;
 use roux::util::RouxError;
+use serde::Deserialize;
 use tokio::time::{sleep, timeout};
 
 use crate::gd::{LevelInfo, search_level};
@@ -61,9 +60,40 @@ impl RedditAuth {
     }
 }
 
+/// Minimal submission fields we read from Reddit's listing response.
+///
+/// We define our own type instead of relying on roux's `SubmissionData` because Reddit can return
+/// negative integers for fields roux types as `u64`, causing deserialization failures.
+#[derive(Deserialize)]
+struct Submission {
+    /// Short alphanumeric post ID (e.g. `"abc123"`), used for deduplication and logging.
+    pub id: String,
+    /// Fullname with type prefix (e.g. `"t3_abc123"`), used as the comment parent.
+    pub name: String,
+    pub title: String,
+    pub author: String,
+    pub created_utc: f64,
+}
+
+/// Wrapper types for deserializing a Reddit listing response.
+#[derive(Deserialize)]
+struct Listing {
+    data: ListingData,
+}
+
+#[derive(Deserialize)]
+struct ListingData {
+    children: Vec<ListingChild>,
+}
+
+#[derive(Deserialize)]
+struct ListingChild {
+    data: Submission,
+}
+
 /// Result of polling the latest subreddit listing.
 enum FetchOutcome {
-    Success(Vec<SubmissionData>),
+    Success(Vec<Submission>),
     Unauthorized,
 }
 
@@ -217,7 +247,7 @@ async fn fetch_latest_submissions(me: &Me) -> Result<FetchOutcome> {
         );
     }
 
-    let listing: BasicListing<SubmissionData> = serde_json::from_str(&body).map_err(|e| {
+    let listing: Listing = serde_json::from_str(&body).map_err(|e| {
         anyhow!(
             "failed to decode Reddit listing: {e}; status={}; content_type={}; body_prefix={:?}",
             status,
@@ -472,7 +502,7 @@ async fn post_reply(
 }
 
 /// Processes a single Reddit submission: extracts a level ID, looks it up, and posts a reply.
-async fn handle_submission(auth: &RedditAuth, me: &mut Me, submission: SubmissionData) {
+async fn handle_submission(auth: &RedditAuth, me: &mut Me, submission: Submission) {
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(_) => {
