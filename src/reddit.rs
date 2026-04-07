@@ -6,21 +6,21 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use futures::StreamExt as _;
 use regex::Regex;
 use roux::Me;
+use roux::submission::SubmissionData;
 use roux::subreddit::Subreddit;
-use roux_stream::stream_submissions;
-use tokio::time::timeout;
-use tokio_retry::strategy::ExponentialBackoff;
+use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::gd::{LevelInfo, search_level};
 
 const SUBREDDIT: &str = "geometrydash";
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const MAX_AGE_SECS: u64 = 60;
-const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const STREAM_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const LISTING_LIMIT: u32 = 100;
+const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const LEVEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const FOOTER: &str = "^this ^is ^an ^automated ^message. ^| ^by ^[sayajiaji](https://www.reddit.com/user/Sayajiaji) ^| ^[instructions](https://www.reddit.com/r/geometrydash/wiki/bot) | ^[source/contribute](https://github.com/cl3847/rgd-zbot/)";
 
 // Both patterns capture the level ID in group 1.
@@ -75,169 +75,148 @@ pub fn format_reply(info: &LevelInfo) -> String {
     format!("{}\n\n___\n\n{}", PostReplyBlock(info), FOOTER)
 }
 
-/// Polls r/geometrydash and replies to posts containing a level ID. Runs until
-/// the underlying stream terminates.
+async fn handle_submission(me: &Me, submission: SubmissionData) {
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            tracing::warn!("system clock is before the Unix epoch; skipping post");
+            return;
+        }
+    };
+    let created_secs = submission.created_utc.max(0.0) as u64;
+    let age_secs = now.saturating_sub(created_secs);
+    let too_old = age_secs > MAX_AGE_SECS;
+    let is_self = me.config.username.as_deref() == Some(submission.author.as_str());
+
+    if too_old || is_self {
+        tracing::debug!(
+            post = %submission.id,
+            age_secs,
+            is_self,
+            "skipping submission"
+        );
+        return;
+    }
+
+    tracing::info!(
+        post = %submission.id,
+        title = %submission.title,
+        "new submission detected"
+    );
+
+    let Some(id) = find_level_id(&submission.title) else {
+        return;
+    };
+
+    tracing::info!(post = %submission.id, level_id = %id, "found level ID");
+
+    let level = match timeout(LEVEL_LOOKUP_TIMEOUT, search_level(&id)).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                post = %submission.id,
+                level_id = %id,
+                timeout_secs = LEVEL_LOOKUP_TIMEOUT.as_secs(),
+                "timed out looking up level"
+            );
+            return;
+        }
+    };
+
+    match level {
+        Ok(Some(info)) => {
+            match timeout(
+                REPLY_TIMEOUT,
+                me.comment(&format_reply(&info), &submission.name),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    tracing::info!(post = %submission.id, level_id = %id, "replied");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(post = %submission.id, "failed to post reply: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        post = %submission.id,
+                        level_id = %id,
+                        timeout_secs = REPLY_TIMEOUT.as_secs(),
+                        "timed out posting reply"
+                    );
+                }
+            }
+        }
+        Ok(None) => tracing::info!(post = %submission.id, level_id = %id, "level not found"),
+        Err(e) => tracing::warn!(post = %submission.id, level_id = %id, "API error: {e}"),
+    }
+}
+
+/// Polls r/geometrydash and replies to posts containing a level ID.
 pub async fn run(me: Me) -> Result<()> {
-    let subreddit = Subreddit::new(SUBREDDIT);
-    let oauth_subreddit = Subreddit::new_oauth(SUBREDDIT, &me.client);
-    let retry = ExponentialBackoff::from_millis(5000).take(3);
+    let subreddit = Subreddit::new_oauth(SUBREDDIT, &me.client);
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut ticker = interval(POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    println!(
-        "STARTUP: probing r/{SUBREDDIT} latest feed with public client (timeout={}s)",
-        STREAM_REQUEST_TIMEOUT.as_secs()
-    );
-    match timeout(STREAM_REQUEST_TIMEOUT, subreddit.latest(5, None)).await {
-        Ok(Ok(listing)) => println!(
-            "STARTUP: public latest ok, received {} submissions",
-            listing.data.children.len()
-        ),
-        Ok(Err(e)) => println!("STARTUP: public latest error: {e}"),
-        Err(_) => println!("STARTUP: public latest timed out"),
-    }
-
-    println!(
-        "STARTUP: probing r/{SUBREDDIT} latest feed with OAuth client (timeout={}s)",
-        STREAM_REQUEST_TIMEOUT.as_secs()
-    );
-    match timeout(STREAM_REQUEST_TIMEOUT, oauth_subreddit.latest(5, None)).await {
-        Ok(Ok(listing)) => println!(
-            "STARTUP: OAuth latest ok, received {} submissions",
-            listing.data.children.len()
-        ),
-        Ok(Err(e)) => println!("STARTUP: OAuth latest error: {e}"),
-        Err(_) => println!("STARTUP: OAuth latest timed out"),
-    }
-
-    // _handle keeps the background polling task alive; dropping it stops the stream.
-    let (mut stream, _handle) = stream_submissions(
-        &subreddit,
-        POLL_INTERVAL,
-        retry,
-        Some(STREAM_REQUEST_TIMEOUT),
-    );
-    let mut seen: HashSet<String> = HashSet::new();
-
-    tracing::info!("monitoring r/{SUBREDDIT}");
-    println!(
-        "STREAM: started r/{SUBREDDIT} poller interval={}s request_timeout={}s",
-        POLL_INTERVAL.as_secs(),
-        STREAM_REQUEST_TIMEOUT.as_secs()
+    tracing::info!(
+        poll_interval_secs = POLL_INTERVAL.as_secs(),
+        poll_timeout_secs = POLL_REQUEST_TIMEOUT.as_secs(),
+        listing_limit = LISTING_LIMIT,
+        "monitoring r/{SUBREDDIT}"
     );
 
     loop {
-        println!(
-            "STREAM: waiting up to {}s for next event",
-            STREAM_IDLE_LOG_INTERVAL.as_secs()
-        );
-        let next_result = match timeout(STREAM_IDLE_LOG_INTERVAL, stream.next()).await {
-            Ok(result) => result,
-            Err(_) => {
-                println!(
-                    "STREAM: no submissions or stream errors received in the last {}s",
-                    STREAM_IDLE_LOG_INTERVAL.as_secs()
-                );
-                continue;
-            }
-        };
+        ticker.tick().await;
 
-        let Some(result) = next_result else {
-            println!("STREAM: stream terminated unexpectedly");
-            tracing::warn!("submission stream terminated unexpectedly");
-            break;
-        };
-
-        let submission = match result {
-            Ok(sub) => sub,
-            Err(e) => {
-                println!("STREAM: error while polling Reddit: {e}");
-                tracing::warn!("stream error: {e}");
-                continue;
-            }
-        };
-
-        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(d) => d.as_secs(),
-            Err(_) => {
-                tracing::warn!("system clock is before the Unix epoch; skipping post");
-                continue;
-            }
-        };
-        let created_secs = submission.created_utc.max(0.0) as u64;
-        let age_secs = now.saturating_sub(created_secs);
-        let too_old = age_secs > MAX_AGE_SECS;
-        let is_self = me.config.username.as_deref() == Some(submission.author.as_str());
-        let already_seen = seen.contains(&submission.id);
-
-        println!(
-            "STREAM: post={} age={}s seen={} self={} title={:?}",
-            submission.id, age_secs, already_seen, is_self, submission.title
-        );
-
-        if already_seen {
-            println!(
-                "STREAM: skipping post={} because it was already seen",
-                submission.id
-            );
-            continue;
-        }
-        if too_old {
-            println!(
-                "STREAM: skipping post={} because it is too old ({}s > {}s)",
-                submission.id, age_secs, MAX_AGE_SECS
-            );
-            continue;
-        }
-        if is_self {
-            println!(
-                "STREAM: skipping post={} because author matches the bot account",
-                submission.id
-            );
-            continue;
-        }
-        // Marked seen before the API call. A transient failure will not be retried,
-        // but this prevents duplicate replies if the stream delivers the same post twice
-        // while an in-flight request is still pending.
-        seen.insert(submission.id.clone());
-
-        let Some(id) = find_level_id(&submission.title) else {
-            println!("STREAM: no level ID match for post={}", submission.id);
-            continue;
-        };
-
-        println!("STREAM: matched level ID {id} for post={}", submission.id);
-        tracing::info!(post = %submission.id, level_id = %id, "found level ID");
-
-        match search_level(&id).await {
-            Ok(Some(info)) => {
-                if let Err(e) = me.comment(&format_reply(&info), &submission.name).await {
-                    println!(
-                        "STREAM: failed to reply to post={} error={e}",
-                        submission.id
-                    );
-                    tracing::warn!(post = %submission.id, "failed to post reply: {e}");
-                } else {
-                    println!("STREAM: replied to post={} level_id={id}", submission.id);
-                    tracing::info!(post = %submission.id, level_id = %id, "replied");
+        let latest =
+            match timeout(POLL_REQUEST_TIMEOUT, subreddit.latest(LISTING_LIMIT, None)).await {
+                Ok(Ok(listing)) => listing,
+                Ok(Err(e)) => {
+                    tracing::warn!("failed to fetch latest submissions: {e}");
+                    continue;
                 }
-            }
-            Ok(None) => {
-                println!(
-                    "STREAM: level lookup returned no result for post={} level_id={id}",
-                    submission.id
-                );
-                tracing::info!(post = %submission.id, level_id = %id, "level not found");
-            }
-            Err(e) => {
-                println!(
-                    "STREAM: level lookup failed for post={} level_id={} error={e}",
-                    submission.id, id
-                );
-                tracing::warn!(post = %submission.id, level_id = %id, "API error: {e}");
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = POLL_REQUEST_TIMEOUT.as_secs(),
+                        "timed out fetching latest submissions"
+                    );
+                    continue;
+                }
+            };
+
+        let latest_submissions: Vec<SubmissionData> = latest
+            .data
+            .children
+            .into_iter()
+            .map(|item| item.data)
+            .collect();
+        let mut latest_ids: HashSet<String> = HashSet::with_capacity(latest_submissions.len());
+        let mut num_new = 0;
+
+        for submission in latest_submissions {
+            let id = submission.id.clone();
+            latest_ids.insert(id.clone());
+            if !seen_ids.contains(&id) {
+                num_new += 1;
+                handle_submission(&me, submission).await;
             }
         }
-    }
 
-    Ok(())
+        tracing::debug!(
+            new_submissions = num_new,
+            fetched = latest_ids.len(),
+            "finished Reddit poll"
+        );
+        if num_new == latest_ids.len() && !seen_ids.is_empty() {
+            tracing::warn!(
+                fetched = latest_ids.len(),
+                "all fetched submissions were new; consider a shorter poll interval"
+            );
+        }
+
+        seen_ids = latest_ids;
+    }
 }
 
 #[cfg(test)]

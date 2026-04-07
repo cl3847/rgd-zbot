@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -33,7 +34,12 @@ const OFFICIAL_SONGS: &[&str] = &[
     "Dash",
 ];
 
-static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("failed to build Boomlings HTTP client")
+});
 
 /// Parsed level info returned by [`search_level`].
 pub struct LevelInfo {
