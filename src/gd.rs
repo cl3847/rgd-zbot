@@ -9,11 +9,28 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 // Base game song tracks, indexed by key 11 in the level data.
 const OFFICIAL_SONGS: &[&str] = &[
-    "Stereo Madness", "Back on Track", "Polargeist", "Dry Out", "Base After Base",
-    "Cant Let Go", "Jumper", "Time Machine", "Cycles", "xStep", "Clutterfunk",
-    "Theory of Everything", "Electroman Adventures", "Clubstep", "Electrodynamix",
-    "Hexagon Force", "Blast Processing", "Theory of Everything 2",
-    "Geometrical Dominator", "Deadlocked", "Fingerdash", "Dash",
+    "Stereo Madness",
+    "Back on Track",
+    "Polargeist",
+    "Dry Out",
+    "Base After Base",
+    "Cant Let Go",
+    "Jumper",
+    "Time Machine",
+    "Cycles",
+    "xStep",
+    "Clutterfunk",
+    "Theory of Everything",
+    "Electroman Adventures",
+    "Clubstep",
+    "Electrodynamix",
+    "Hexagon Force",
+    "Blast Processing",
+    "Theory of Everything 2",
+    "Geometrical Dominator",
+    "Deadlocked",
+    "Fingerdash",
+    "Dash",
 ];
 
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
@@ -39,7 +56,12 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
     let body = HTTP
         .post("https://www.boomlings.com/database/getGJLevels21.php")
         .header("User-Agent", "")
-        .form(&[("secret", "Wmfd2893gb7"), ("type", "0"), ("str", id), ("count", "1")])
+        .form(&[
+            ("secret", "Wmfd2893gb7"),
+            ("type", "0"),
+            ("str", id),
+            ("count", "1"),
+        ])
         .send()
         .await?
         .error_for_status()?
@@ -70,15 +92,15 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
     let (song_name, song_artist, song_id) = resolve_song(&kv, sections.get(2).copied());
 
     Ok(Some(LevelInfo {
-        id:               kv.get("1").and_then(|s| s.parse().ok()).unwrap_or(0),
-        name:             kv.get("2").copied().unwrap_or("").to_owned(),
-        description:      decode_description(kv.get("3").copied()),
+        id: kv.get("1").and_then(|s| s.parse().ok()).unwrap_or(0),
+        name: kv.get("2").copied().unwrap_or("").to_owned(),
+        description: decode_description(kv.get("3").copied()),
         creator_username,
-        difficulty:       resolve_difficulty(&kv),
-        stars:            kv.get("18").and_then(|s| s.parse().ok()).unwrap_or(0),
-        downloads:        kv.get("10").and_then(|s| s.parse().ok()).unwrap_or(0),
-        likes:            kv.get("14").and_then(|s| s.parse().ok()).unwrap_or(0),
-        length:           resolve_length(&kv),
+        difficulty: resolve_difficulty(&kv),
+        stars: kv.get("18").and_then(|s| s.parse().ok()).unwrap_or(0),
+        downloads: kv.get("10").and_then(|s| s.parse().ok()).unwrap_or(0),
+        likes: kv.get("14").and_then(|s| s.parse().ok()).unwrap_or(0),
+        length: resolve_length(&kv),
         song_name,
         song_artist,
         song_id,
@@ -123,7 +145,7 @@ fn resolve_difficulty(kv: &HashMap<&str, &str>) -> String {
             Some("4") => "Medium Demon",
             Some("5") => "Insane Demon",
             Some("6") => "Extreme Demon",
-            _         => "Hard Demon",
+            _ => "Hard Demon",
         }
         .to_owned();
     }
@@ -136,7 +158,7 @@ fn resolve_difficulty(kv: &HashMap<&str, &str>) -> String {
         Some("30") => "Hard",
         Some("40") => "Harder",
         Some("50") => "Insane",
-        _          => "N/A",
+        _ => "N/A",
     }
     .to_owned()
 }
@@ -150,7 +172,7 @@ fn resolve_length(kv: &HashMap<&str, &str>) -> String {
         Some("3") => "Long",
         Some("4") => "XL",
         Some("5") => "Platformer",
-        _         => "Unknown",
+        _ => "Unknown",
     }
     .to_owned()
 }
@@ -173,8 +195,15 @@ fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String
     };
 
     let Some(section) = song_section else {
-        tracing::warn!(song_id = target_id, "custom song ID present but song section missing");
-        return ("Unknown".to_owned(), "Unknown".to_owned(), target_id.parse().unwrap_or(0));
+        tracing::warn!(
+            song_id = target_id,
+            "custom song ID present but song section missing"
+        );
+        return (
+            "Unknown".to_owned(),
+            "Unknown".to_owned(),
+            target_id.parse().unwrap_or(0),
+        );
     };
 
     let song_kv: HashMap<&str, &str> = section
@@ -193,5 +222,9 @@ fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String
     }
 
     tracing::warn!(song_id = target_id, "custom song not found in song section");
-    ("Unknown".to_owned(), "Unknown".to_owned(), target_id.parse().unwrap_or(0))
+    (
+        "Unknown".to_owned(),
+        "Unknown".to_owned(),
+        target_id.parse().unwrap_or(0),
+    )
 }

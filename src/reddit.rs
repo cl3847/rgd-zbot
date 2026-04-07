@@ -32,9 +32,9 @@ static ID_PATTERNS: LazyLock<[Regex; 2]> = LazyLock::new(|| {
 
 /// Scans a post title for a GD level ID. Returns the first match, or `None`.
 pub fn find_level_id(title: &str) -> Option<String> {
-    ID_PATTERNS.iter().find_map(|re| {
-        re.captures(title)?.get(1).map(|m| m.as_str().to_owned())
-    })
+    ID_PATTERNS
+        .iter()
+        .find_map(|re| re.captures(title)?.get(1).map(|m| m.as_str().to_owned()))
 }
 
 /// Reddit markdown block for a single level.
@@ -43,15 +43,27 @@ pub struct PostReplyBlock<'a>(pub &'a LevelInfo);
 impl fmt::Display for PostReplyBlock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let info = self.0;
-        writeln!(f, "**Level:** *{}* by {} ({})  ", info.name, info.creator_username, info.id)?;
+        writeln!(
+            f,
+            "**Level:** *{}* by {} ({})  ",
+            info.name, info.creator_username, info.id
+        )?;
         if !info.description.is_empty() {
             // Newlines in the description would break out of the blockquote; flatten them.
             let desc = info.description.replace('\n', " ");
             write!(f, "**Description:**  \n> {desc}\n\n")?;
         }
         writeln!(f, "**Difficulty:** {}* ({})  ", info.stars, info.difficulty)?;
-        writeln!(f, "**Stats:** {} downloads | {} likes | {}  ", info.downloads, info.likes, info.length)?;
-        writeln!(f, "**Song:** *{}* by {} ({})  ", info.song_name, info.song_artist, info.song_id)
+        writeln!(
+            f,
+            "**Stats:** {} downloads | {} likes | {}  ",
+            info.downloads, info.likes, info.length
+        )?;
+        writeln!(
+            f,
+            "**Song:** *{}* by {} ({})  ",
+            info.song_name, info.song_artist, info.song_id
+        )
     }
 }
 
@@ -98,7 +110,9 @@ pub async fn run(me: Me) -> Result<()> {
         // while an in-flight request is still pending.
         seen.insert(submission.id.clone());
 
-        let Some(id) = find_level_id(&submission.title) else { continue };
+        let Some(id) = find_level_id(&submission.title) else {
+            continue;
+        };
 
         tracing::info!(post = %submission.id, level_id = %id, "found level ID");
 
@@ -127,28 +141,44 @@ mod tests {
     }
 
     fn extracts(title: &str) -> &str {
-        Box::leak(find_level_id(title).expect("expected a match").into_boxed_str())
+        Box::leak(
+            find_level_id(title)
+                .expect("expected a match")
+                .into_boxed_str(),
+        )
     }
 
     // ── pattern 1: explicit "id" keyword ─────────────────────────────────────
 
     #[test]
-    fn id_space() { assert_eq!(extracts("id 12345678"), "12345678"); }
+    fn id_space() {
+        assert_eq!(extracts("id 12345678"), "12345678");
+    }
 
     #[test]
-    fn id_colon() { assert_eq!(extracts("ID: 12345678"), "12345678"); }
+    fn id_colon() {
+        assert_eq!(extracts("ID: 12345678"), "12345678");
+    }
 
     #[test]
-    fn id_equals() { assert_eq!(extracts("id=12345678"), "12345678"); }
+    fn id_equals() {
+        assert_eq!(extracts("id=12345678"), "12345678");
+    }
 
     #[test]
-    fn id_is_keyword() { assert_eq!(extracts("id is 12345678"), "12345678"); }
+    fn id_is_keyword() {
+        assert_eq!(extracts("id is 12345678"), "12345678");
+    }
 
     #[test]
-    fn id_uppercase() { assert_eq!(extracts("ID 12345678"), "12345678"); }
+    fn id_uppercase() {
+        assert_eq!(extracts("ID 12345678"), "12345678");
+    }
 
     #[test]
-    fn id_mid_sentence() { assert_eq!(extracts("my level id 12345678 is cool"), "12345678"); }
+    fn id_mid_sentence() {
+        assert_eq!(extracts("my level id 12345678 is cool"), "12345678");
+    }
 
     #[test]
     fn id_after_punctuation() {
@@ -160,18 +190,26 @@ mod tests {
     }
 
     #[test]
-    fn id_at_start() { assert_eq!(extracts("id12345678 is a cool level"), "12345678"); }
+    fn id_at_start() {
+        assert_eq!(extracts("id12345678 is a cool level"), "12345678");
+    }
 
     // ── pattern 2: bracketed ─────────────────────────────────────────────────
 
     #[test]
-    fn bracketed_square() { assert_eq!(extracts("[12345678]"), "12345678"); }
+    fn bracketed_square() {
+        assert_eq!(extracts("[12345678]"), "12345678");
+    }
 
     #[test]
-    fn bracketed_paren() { assert_eq!(extracts("(12345678)"), "12345678"); }
+    fn bracketed_paren() {
+        assert_eq!(extracts("(12345678)"), "12345678");
+    }
 
     #[test]
-    fn bracketed_mid_sentence() { assert_eq!(extracts("check this level [12345678] out"), "12345678"); }
+    fn bracketed_mid_sentence() {
+        assert_eq!(extracts("check this level [12345678] out"), "12345678");
+    }
 
     #[test]
     fn bracketed_escaped() {
@@ -182,13 +220,19 @@ mod tests {
     // ── digit boundaries ─────────────────────────────────────────────────────
 
     #[test]
-    fn exactly_six_digits() { assert_eq!(extracts("id 123456"), "123456"); }
+    fn exactly_six_digits() {
+        assert_eq!(extracts("id 123456"), "123456");
+    }
 
     #[test]
-    fn exactly_ten_digits() { assert_eq!(extracts("id 1234567890"), "1234567890"); }
+    fn exactly_ten_digits() {
+        assert_eq!(extracts("id 1234567890"), "1234567890");
+    }
 
     #[test]
-    fn five_digits_no_match() { assert!(!matches("id 12345")); }
+    fn five_digits_no_match() {
+        assert!(!matches("id 12345"));
+    }
 
     #[test]
     fn eleven_digits_no_match() {
@@ -264,14 +308,23 @@ mod tests {
     #[test]
     fn reply_block_contains_level_name() {
         let block = PostReplyBlock(&sample_level()).to_string();
-        assert!(block.contains("*Test Level*"), "expected italicised level name");
+        assert!(
+            block.contains("*Test Level*"),
+            "expected italicised level name"
+        );
     }
 
     #[test]
     fn reply_block_difficulty_matches_legacy_format() {
         let block = PostReplyBlock(&sample_level()).to_string();
-        assert!(block.contains("6*"), "expected star count with trailing asterisk");
-        assert!(!block.contains("*6*"), "did not expect italicised star count");
+        assert!(
+            block.contains("6*"),
+            "expected star count with trailing asterisk"
+        );
+        assert!(
+            !block.contains("*6*"),
+            "did not expect italicised star count"
+        );
         assert!(block.contains("(Hard)"), "expected difficulty in parens");
     }
 
@@ -280,7 +333,10 @@ mod tests {
         let mut info = sample_level();
         info.description = String::new();
         let block = PostReplyBlock(&info).to_string();
-        assert!(!block.contains("Description"), "unexpected description line");
+        assert!(
+            !block.contains("Description"),
+            "unexpected description line"
+        );
     }
 
     #[test]
@@ -288,8 +344,10 @@ mod tests {
         let mut info = sample_level();
         info.description = "line one\nline two".to_owned();
         let block = PostReplyBlock(&info).to_string();
-        assert!(!block.contains('\n') || block.lines().all(|l| !l.starts_with("line")),
-            "raw newline leaked into blockquote");
+        assert!(
+            !block.contains('\n') || block.lines().all(|l| !l.starts_with("line")),
+            "raw newline leaked into blockquote"
+        );
     }
 
     #[test]
