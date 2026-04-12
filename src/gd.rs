@@ -56,6 +56,8 @@ pub struct LevelInfo {
     pub song_name: String,
     pub song_artist: String,
     pub song_id: u32,
+    /// `true` when the song is one of the built-in GD tracks (key 11), `false` for custom songs (key 35).
+    pub is_official_song: bool,
 }
 
 /// Fetches level info by ID from the Boomlings API. Returns `None` if the level doesn't exist.
@@ -106,7 +108,8 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
         .unwrap_or("-")
         .to_owned();
 
-    let (song_name, song_artist, song_id) = resolve_song(&kv, sections.get(2).copied());
+    let (song_name, song_artist, song_id, is_official_song) =
+        resolve_song(&kv, sections.get(2).copied());
 
     Ok(Some(LevelInfo {
         id: actual_id.parse().unwrap_or(0),
@@ -121,6 +124,7 @@ pub async fn search_level(id: &str) -> Result<Option<LevelInfo>> {
         song_name,
         song_artist,
         song_id,
+        is_official_song,
     }))
 }
 
@@ -200,8 +204,11 @@ fn resolve_length(kv: &HashMap<&str, &str>) -> String {
     .to_owned()
 }
 
-/// Returns `(name, artist, id)` for the level's song, resolving official tracks or custom Newgrounds songs.
-fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String, String, u32) {
+/// Returns `(name, artist, id, is_official_song)` for the level's song.
+fn resolve_song(
+    kv: &HashMap<&str, &str>,
+    song_section: Option<&str>,
+) -> (String, String, u32, bool) {
     let Some(target_id) = kv.get("35").copied().filter(|&id| id != "0") else {
         let idx = kv
             .get("11")
@@ -214,7 +221,7 @@ fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String
             tracing::warn!(song_index = idx, "official song index out of range");
         }
         let name = OFFICIAL_SONGS.get(idx).copied().unwrap_or("Unknown");
-        return (name.to_owned(), "RobTop".to_owned(), idx as u32);
+        return (name.to_owned(), "RobTop".to_owned(), idx as u32, true);
     };
 
     let Some(section) = song_section else {
@@ -226,6 +233,7 @@ fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String
             "Unknown".to_owned(),
             "Unknown".to_owned(),
             target_id.parse().unwrap_or(0),
+            false,
         );
     };
 
@@ -241,6 +249,7 @@ fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String
             song_kv.get("2").copied().unwrap_or("Unknown").to_owned(),
             song_kv.get("4").copied().unwrap_or("Unknown").to_owned(),
             target_id.parse().unwrap_or(0),
+            false,
         );
     }
 
@@ -249,5 +258,6 @@ fn resolve_song(kv: &HashMap<&str, &str>, song_section: Option<&str>) -> (String
         "Unknown".to_owned(),
         "Unknown".to_owned(),
         target_id.parse().unwrap_or(0),
+        false,
     )
 }

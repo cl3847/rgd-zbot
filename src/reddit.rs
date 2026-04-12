@@ -149,8 +149,8 @@ impl fmt::Display for PostReplyBlock<'_> {
 
         write!(
             f,
-            "**{}** by {} ({})",
-            info.name, info.creator_username, info.id
+            "**[{}](https://gdbrowser.com/{})** by {} ({})",
+            info.name, info.id, info.creator_username, info.id
         )?;
 
         let description = info.description.trim();
@@ -166,6 +166,15 @@ impl fmt::Display for PostReplyBlock<'_> {
             format_number(info.likes as u64)
         };
 
+        let song_display = if !info.is_official_song && info.song_id < 10_000_000 {
+            format!(
+                "[{}](https://www.newgrounds.com/audio/listen/{})",
+                info.song_name, info.song_id
+            )
+        } else {
+            info.song_name.clone()
+        };
+
         write!(
             f,
             "\n\n{} · {}★ · {} · {} downloads · {} likes  \n*{}* by {} ({})",
@@ -174,7 +183,7 @@ impl fmt::Display for PostReplyBlock<'_> {
             info.length,
             format_number(info.downloads),
             likes,
-            info.song_name,
+            song_display,
             info.song_artist,
             info.song_id,
         )
@@ -789,13 +798,17 @@ mod tests {
             song_name: "Cool Song".to_owned(),
             song_artist: "Some Artist".to_owned(),
             song_id: 999999,
+            is_official_song: false,
         }
     }
 
     #[test]
     fn reply_block_contains_level_name() {
         let block = PostReplyBlock(&sample_level()).to_string();
-        assert!(block.contains("**Test Level**"), "expected bold level name");
+        assert!(
+            block.contains("**[Test Level](https://gdbrowser.com/12345678)**"),
+            "expected bold linked level name"
+        );
     }
 
     #[test]
