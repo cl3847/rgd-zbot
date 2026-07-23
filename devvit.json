@@ -1,0 +1,25 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "rgeometrydash",
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.js"
+  },
+  "permissions": {
+    "http": {
+      "enable": true,
+      "domains": ["www.boomlings.com"]
+    },
+    "reddit": true,
+    "redis": true
+  },
+  "triggers": {
+    "onPostSubmit": "/internal/triggers/on-post-submit"
+  },
+  "scripts": {
+    "dev": "npm run watch"
+  },
+  "dev": {
+    "subreddit": "rgeometrydash_dev"
+  }
+}
