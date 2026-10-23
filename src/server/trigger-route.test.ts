@@ -59,6 +59,9 @@ let calls: string[]
 let logs: CapturedLog[]
 let submitAttempts: number
 let failFirstSubmit: boolean
+let moderationAttempts: number
+let moderationFailuresRemaining: number
+let moderatedCommentIds: string[]
 let durableState: Map<string, string>
 let leases: Map<string, LeaseRecord>
 let versions: Map<string, number>
@@ -116,6 +119,9 @@ beforeEach(() => {
   logs = []
   submitAttempts = 0
   failFirstSubmit = false
+  moderationAttempts = 0
+  moderationFailuresRemaining = 0
+  moderatedCommentIds = []
   durableState = new Map()
   leases = new Map()
   versions = new Map()
@@ -231,7 +237,20 @@ beforeEach(() => {
     if (failFirstSubmit && submitAttempts === 1) {
       throw new Error(HOSTILE)
     }
-    return {id: `t1_reply_${submitAttempts}`}
+    const commentId = `t1_reply_${submitAttempts}`
+    return {
+      id: commentId,
+      distinguish: async (makeSticky?: boolean) => {
+        calls.push('distinguish')
+        moderationAttempts += 1
+        moderatedCommentIds.push(commentId)
+        assert.equal(makeSticky, true)
+        if (moderationFailuresRemaining > 0) {
+          moderationFailuresRemaining -= 1
+          throw new Error(HOSTILE)
+        }
+      },
+    }
   }) as unknown as typeof reddit.submitComment
 
   console.info = (...values) => {
@@ -287,6 +306,16 @@ test('claims with an expiring fresh owner before lookup and submits one app comm
   assert.deepEqual(await rsp.json(), {})
   assert.equal(calls.indexOf('set') < calls.indexOf('fetch'), true)
   assert.equal(submitAttempts, 1)
+  assert.equal(moderationAttempts, 1)
+  assert.deepEqual(moderatedCommentIds, ['t1_reply_1'])
+  assert.equal(
+    calls.indexOf('submitComment') < calls.indexOf('retain:confirmed'),
+    true,
+  )
+  assert.equal(
+    calls.indexOf('retain:confirmed') < calls.indexOf('distinguish'),
+    true,
+  )
   assert.match(durableState.get('t3_route') ?? '', /^confirmed:[0-9a-f-]{36}$/)
   assert.equal(leases.has(CLAIM_KEY), false)
   const firstLease = calls.indexOf('set')
@@ -298,6 +327,82 @@ test('claims with an expiring fresh owner before lookup and submits one app comm
         expiration >= startedAt + 59_000 && expiration <= Date.now() + 61_000,
     ),
   )
+
+  const replyEvent = parsedEvents().find(
+    event => event.event === 'reply_created',
+  )
+  const moderationEvent = parsedEvents().find(
+    event => event.event === 'moderation_succeeded',
+  )
+  assert.deepEqual(replyEvent, {
+    event: 'reply_created',
+    postId: 't3_route',
+    levelId: '12345678',
+    commentId: 't1_reply_1',
+    stage: 'submit',
+    outcome: 'replied',
+  })
+  assert.deepEqual(moderationEvent, {
+    event: 'moderation_succeeded',
+    postId: 't3_route',
+    levelId: '12345678',
+    commentId: 't1_reply_1',
+    stage: 'moderation',
+    outcome: 'succeeded',
+  })
+})
+
+test('route retries distinguish(true) once and succeeds with one APP submission', async () => {
+  moderationFailuresRemaining = 1
+
+  const rsp = await postTrigger(validPayload())
+
+  assert.equal(rsp.status, 200)
+  assert.deepEqual(await rsp.json(), {})
+  assert.equal(submitAttempts, 1)
+  assert.equal(moderationAttempts, 2)
+  assert.deepEqual(moderatedCommentIds, ['t1_reply_1', 't1_reply_1'])
+  assert.equal(
+    eventNames().filter(name => name === 'moderation_retrying').length,
+    1,
+  )
+  assert.equal(
+    eventNames().filter(name => name === 'moderation_succeeded').length,
+    1,
+  )
+  assert.equal(durableState.get('t3_route')?.startsWith('confirmed:'), true)
+})
+
+test('route keeps HTTP 200 and confirmed state after two sanitized moderation failures', async () => {
+  moderationFailuresRemaining = 2
+
+  const rsp = await postTrigger(validPayload())
+
+  assert.equal(rsp.status, 200)
+  assert.deepEqual(await rsp.json(), {})
+  assert.equal(submitAttempts, 1)
+  assert.equal(moderationAttempts, 2)
+  assert.deepEqual(moderatedCommentIds, ['t1_reply_1', 't1_reply_1'])
+  assert.equal(calls.includes('getComments'), false)
+  assert.equal(durableState.get('t3_route')?.startsWith('confirmed:'), true)
+
+  const failures = logs.filter(log => {
+    const event = JSON.parse(log.text) as {readonly event?: string}
+    return event.event === 'moderation_failed'
+  })
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0]?.severity, 'error')
+  assert.deepEqual(JSON.parse(failures[0]?.text ?? '{}'), {
+    event: 'moderation_failed',
+    postId: 't3_route',
+    levelId: '12345678',
+    commentId: 't1_reply_1',
+    stage: 'moderation',
+    outcome: 'failed',
+    category: 'moderation_failed',
+    summary: 'Comment moderation failed',
+  })
+  assertSafeLogs()
 })
 
 test('exhaustive reconciliation finds an expected reply older than the first 100', async () => {
@@ -618,6 +723,7 @@ function createTransaction(
       operations.push(() => {
         for (const [field, value] of Object.entries(values)) {
           durableState.set(field, value)
+          if (value.startsWith('confirmed:')) calls.push('retain:confirmed')
         }
         bump(key)
         return Object.keys(values).length
@@ -726,10 +832,13 @@ async function assertInvalidResponse(rsp: Response): Promise<void> {
 }
 
 function eventNames(): string[] {
-  return logs.map(log => {
-    const event = JSON.parse(log.text) as {readonly event?: string}
-    return event.event ?? ''
-  })
+  return parsedEvents().map(event =>
+    typeof event.event === 'string' ? event.event : '',
+  )
+}
+
+function parsedEvents(): Array<Record<string, unknown>> {
+  return logs.map(log => JSON.parse(log.text) as Record<string, unknown>)
 }
 
 function assertSafeLogs(): void {

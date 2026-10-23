@@ -55,10 +55,10 @@ const COMPLETE_BOOMLINGS_RESPONSE = [
 
 const EXPECTED_REPLY = `**[Bloodbath](https://gdbrowser.com/${LEVEL_ID})** by Riot (${LEVEL_ID})
 
-> A legendary level with blood.
+> A legendary level with blood\\.
 
 Extreme Demon · 10★ · Long · 1,234,567 downloads · -1,234 likes  
-*At the Speed of Light* by Dimrain47
+*[At the Speed of Light](https://www.newgrounds.com/audio/listen/999999)* by Dimrain47
 
 ___
 
@@ -128,6 +128,7 @@ test('turns one qualifying post event into one complete parity reply', async () 
         description: 'A legendary level\nwith blood.',
         creatorUsername: 'Riot',
         difficulty: 'Extreme Demon',
+        rating: null,
         stars: 10,
         downloads: 1_234_567,
         likes: -1_234,
@@ -141,7 +142,10 @@ test('turns one qualifying post event into one complete parity reply', async () 
     },
     submitComment: async (postId, text) => {
       submitted.push({postId, text})
-      return {id: 't1_reply'}
+      return {
+        id: 't1_reply',
+        distinguishAndSticky: async () => {},
+      }
     },
     log: () => {},
   }
@@ -164,7 +168,6 @@ test('turns one qualifying post event into one complete parity reply', async () 
   assert.equal(fetchCount, 1)
   assert.deepEqual(submitted, [{postId: POST_ID, text: EXPECTED_REPLY}])
   assert.equal(FOOTER, FOOTER_FROM_RUST)
-  assert.equal(submitted[0]?.text.includes('newgrounds.com'), false)
   assert.equal(submitted[0]?.text.includes('(999999)'), false)
 })
 
@@ -210,6 +213,7 @@ test('formats official songs without a link or visible song ID', () => {
     description: '',
     creatorUsername: '-',
     difficulty: 'Easy',
+    rating: null,
     stars: 2,
     downloads: 10,
     likes: 5,

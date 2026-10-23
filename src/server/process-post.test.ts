@@ -21,6 +21,7 @@ const LEVEL: LevelInfo = {
   description: 'A level description that must never enter logs',
   creatorUsername: 'Riot',
   difficulty: 'Extreme Demon',
+  rating: null,
   stars: 10,
   downloads: 1_000,
   likes: 500,
@@ -56,8 +57,13 @@ function harness(overrides: Partial<ProcessDependencies> = {}) {
   let promoteCount = 0
   let inspectCount = 0
   let authorizeCount = 0
+  let releaseCount = 0
+  let moderationAttempts = 0
+  let moderationFailuresRemaining = 0
+  let moderationFailure: unknown = new Error('moderation failed')
   const order: string[] = []
   const submitted: Array<{postId: string; text: string}> = []
+  const moderatedCommentIds: string[] = []
   const logs: LogEntry[] = []
 
   const activeLease = (): LiveLease | undefined => {
@@ -100,11 +106,13 @@ function harness(overrides: Partial<ProcessDependencies> = {}) {
       return fresh
     },
     release: async (_postId, candidate) => {
+      releaseCount += 1
       if (ownsLease(candidate)) lease = undefined
     },
     retain: async (_postId, candidate, state) => {
       if (!ownsLease(candidate)) return false
       if (durable && !lineageMatches(candidate)) return false
+      order.push(`retain:${state}`)
       durable = {state, token: candidate.token}
       lease = undefined
       return true
@@ -143,7 +151,19 @@ function harness(overrides: Partial<ProcessDependencies> = {}) {
       submitCount += 1
       order.push('submitComment')
       submitted.push({postId, text})
-      return {id: `t1_reply_${submitCount}`}
+      const commentId = `t1_reply_${submitCount}`
+      return {
+        id: commentId,
+        distinguishAndSticky: async () => {
+          moderationAttempts += 1
+          moderatedCommentIds.push(commentId)
+          order.push(`distinguish:${commentId}`)
+          if (moderationFailuresRemaining > 0) {
+            moderationFailuresRemaining -= 1
+            throw moderationFailure
+          }
+        },
+      }
     },
     reconcile: async () => {
       reconcileCount += 1
@@ -167,12 +187,19 @@ function harness(overrides: Partial<ProcessDependencies> = {}) {
     inspectCount: () => inspectCount,
     lease: () => activeLease(),
     lookupCount: () => lookupCount,
+    moderateFailures: (count: number, error: unknown = moderationFailure) => {
+      moderationFailuresRemaining = count
+      moderationFailure = error
+    },
+    moderatedCommentIds,
+    moderationAttempts: () => moderationAttempts,
     orphanPromotion: (token = 'orphan-token') => {
       durable = {state: 'promotion', token}
       lease = undefined
     },
     promoteCount: () => promoteCount,
     reconcileCount: () => reconcileCount,
+    releaseCount: () => releaseCount,
     submitCount: () => submitCount,
   }
 }
@@ -384,13 +411,15 @@ test('final promotion uncertainty writes nothing and remains recoverable on rede
     (await processPost(post(), state.dependencies)).status,
     'replied',
   )
-  assert.deepEqual(state.order.slice(-6), [
+  assert.deepEqual(state.order.slice(-8), [
     'reconcile',
     'lookup',
     'format',
     'promote',
     'authorizeWrite',
     'submitComment',
+    'retain:confirmed',
+    'distinguish:t1_reply_1',
   ])
   assert.equal(state.submitCount(), 1)
 })
@@ -540,12 +569,19 @@ test('D-04 retains unresolved after an inconclusive or failed comment read', asy
 
 test('D-04 retries once after definitive absence and confirms the successful retry', async () => {
   let attempts = 0
+  let retryModerationAttempts = 0
   const state = harness({
     reconcile: async () => 'absent',
     submitComment: async () => {
       attempts += 1
       if (attempts === 1) throw new Error('ambiguous')
-      return {id: 't1_retry'}
+      return {
+        id: 't1_retry',
+        distinguishAndSticky: async () => {
+          retryModerationAttempts += 1
+          state.order.push('distinguish:t1_retry')
+        },
+      }
     },
   })
 
@@ -557,6 +593,121 @@ test('D-04 retries once after definitive absence and confirms the successful ret
   assert.equal(attempts, 2)
   assert.equal(state.authorizeCount(), 2)
   assert.equal(state.durable()?.state, 'confirmed')
+  assert.equal(retryModerationAttempts, 1)
+  assert.equal(
+    state.order.indexOf('retain:confirmed') <
+      state.order.indexOf('distinguish:t1_retry'),
+    true,
+  )
+})
+
+test('D-01/D-02 moderates the confirmed returned comment once on success', async () => {
+  const state = harness()
+
+  assert.deepEqual(await processPost(post(), state.dependencies), {
+    status: 'replied',
+    levelId: LEVEL_ID,
+    commentId: 't1_reply_1',
+  })
+  assert.equal(state.submitCount(), 1)
+  assert.equal(state.moderationAttempts(), 1)
+  assert.deepEqual(state.moderatedCommentIds, ['t1_reply_1'])
+  assert.equal(
+    state.order.indexOf('retain:confirmed') <
+      state.order.indexOf('distinguish:t1_reply_1'),
+    true,
+  )
+  assert.deepEqual(
+    state.logs
+      .filter(entry => entry.event.event === 'moderation_succeeded')
+      .map(entry => entry.event),
+    [
+      {
+        event: 'moderation_succeeded',
+        postId: POST_ID,
+        levelId: LEVEL_ID,
+        commentId: 't1_reply_1',
+        stage: 'moderation',
+        outcome: 'succeeded',
+      },
+    ],
+  )
+})
+
+test('D-02 retries moderation once immediately and succeeds without another comment', async () => {
+  const state = harness()
+  state.moderateFailures(1)
+
+  assert.deepEqual(await processPost(post(), state.dependencies), {
+    status: 'replied',
+    levelId: LEVEL_ID,
+    commentId: 't1_reply_1',
+  })
+  assert.equal(state.submitCount(), 1)
+  assert.equal(state.moderationAttempts(), 2)
+  assert.equal(state.durable()?.state, 'confirmed')
+  assert.equal(
+    state.logs.filter(entry => entry.event.event === 'moderation_retrying')
+      .length,
+    1,
+  )
+  assert.equal(
+    state.logs.filter(entry => entry.event.event === 'moderation_succeeded')
+      .length,
+    1,
+  )
+})
+
+test('D-01 through D-04 keep a confirmed reply after two sanitized moderation failures', async () => {
+  const hostile = [
+    'credential=TOP_SECRET',
+    'title=private title',
+    LEVEL.description,
+    'authorization=Bearer PRIVATE_TOKEN',
+    'raw response body',
+    'stack at private.ts:1',
+  ].join(' | ')
+  const state = harness()
+  state.moderateFailures(2, new Error(hostile))
+
+  assert.deepEqual(await processPost(post(), state.dependencies), {
+    status: 'replied',
+    levelId: LEVEL_ID,
+    commentId: 't1_reply_1',
+  })
+  assert.equal(state.submitCount(), 1)
+  assert.equal(state.moderationAttempts(), 2)
+  assert.equal(state.durable()?.state, 'confirmed')
+  assert.equal(state.reconcileCount(), 0)
+  assert.equal(state.releaseCount(), 0)
+  assert.deepEqual(state.moderatedCommentIds, ['t1_reply_1', 't1_reply_1'])
+
+  const failures = state.logs.filter(
+    entry => entry.event.event === 'moderation_failed',
+  )
+  assert.equal(failures.length, 1)
+  assert.equal(failures[0]?.severity, 'error')
+  assert.deepEqual(failures[0]?.event, {
+    event: 'moderation_failed',
+    postId: POST_ID,
+    levelId: LEVEL_ID,
+    commentId: 't1_reply_1',
+    stage: 'moderation',
+    outcome: 'failed',
+    category: 'moderation_failed',
+    summary: 'Comment moderation failed',
+  })
+
+  const serialized = JSON.stringify(state.logs)
+  for (const fragment of [
+    'TOP_SECRET',
+    'private title',
+    LEVEL.description,
+    'PRIVATE_TOKEN',
+    'raw response body',
+    'private.ts',
+  ])
+    assert.equal(serialized.includes(fragment), false, fragment)
 })
 
 test('D-12 through D-14 use fixed summaries and classify each failure exactly once', async () => {

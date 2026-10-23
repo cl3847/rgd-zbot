@@ -39,6 +39,7 @@ export type ProcessErrorCategory =
   | 'submit_ambiguous'
   | 'reconcile_inconclusive'
   | 'retry_ambiguous'
+  | 'moderation_failed'
 
 export type LifecycleEvent = {
   readonly event:
@@ -52,10 +53,14 @@ export type LifecycleEvent = {
     | 'reconciliation_found'
     | 'reconciliation_absent'
     | 'reply_retried'
+    | 'moderation_retrying'
+    | 'moderation_succeeded'
+    | 'moderation_failed'
     | 'processing_failed'
     | 'processing_abandoned'
   readonly postId?: PostId
   readonly levelId?: string
+  readonly commentId?: string
   readonly stage?: string
   readonly outcome?: string
   readonly category?: ProcessErrorCategory
@@ -79,6 +84,11 @@ export type ProcessResult =
       readonly commentId: string
     }
 
+type SubmittedComment = {
+  readonly id: string
+  distinguishAndSticky(): Promise<void>
+}
+
 export type ProcessDependencies = {
   now(): number
   getAppUsername(): Promise<string | undefined>
@@ -98,7 +108,7 @@ export type ProcessDependencies = {
   authorizeWrite(postId: PostId, lease: ClaimLease): Promise<boolean>
   lookup(levelId: string): Promise<LevelInfo | null>
   format(level: LevelInfo): string
-  submitComment(postId: PostId, text: string): Promise<{readonly id: string}>
+  submitComment(postId: PostId, text: string): Promise<SubmittedComment>
   reconcile(postId: PostId, levelId: string): Promise<ReconciliationResult>
   log(severity: LogSeverity, event: LifecycleEvent): void
 }
@@ -115,6 +125,7 @@ const SAFE_SUMMARIES = {
   submit_ambiguous: 'Comment submission outcome is uncertain',
   reconcile_inconclusive: 'Comment reconciliation was inconclusive',
   retry_ambiguous: 'Comment retry outcome is uncertain',
+  moderation_failed: 'Comment moderation failed',
 } as const satisfies Record<ProcessErrorCategory, string>
 
 export class ProcessPostError extends Error {
@@ -264,28 +275,31 @@ export async function processPost(
   }
 
   await authorizeWrite(dependencies, post.id, levelId, lease, 'submit')
+  let comment: SubmittedComment
   try {
-    const comment = await dependencies.submitComment(post.id, text)
-    await retainOrThrow(
-      dependencies,
-      post.id,
-      levelId,
-      lease,
-      'confirmed',
-      'submit',
-    )
-    log(dependencies, 'info', {
-      event: 'reply_created',
-      postId: post.id,
-      levelId,
-      stage: 'submit',
-      outcome: 'replied',
-    })
-    return {status: 'replied', levelId, commentId: comment.id}
+    comment = await dependencies.submitComment(post.id, text)
   } catch (error) {
     if (error instanceof ProcessPostError) throw error
     return reconcileAmbiguousSubmit(post.id, levelId, text, lease, dependencies)
   }
+  await retainOrThrow(
+    dependencies,
+    post.id,
+    levelId,
+    lease,
+    'confirmed',
+    'submit',
+  )
+  log(dependencies, 'info', {
+    event: 'reply_created',
+    postId: post.id,
+    levelId,
+    commentId: comment.id,
+    stage: 'submit',
+    outcome: 'replied',
+  })
+  await moderateSubmittedComment(dependencies, post.id, levelId, comment)
+  return {status: 'replied', levelId, commentId: comment.id}
 }
 
 function normalizeTimestamp(createdAt: number): number | undefined {
@@ -624,24 +638,9 @@ async function reconcileAmbiguousSubmit(
     outcome: 'retrying',
   })
   await authorizeWrite(dependencies, postId, levelId, lease, 'retry')
+  let comment: SubmittedComment
   try {
-    const comment = await dependencies.submitComment(postId, text)
-    await retainOrThrow(
-      dependencies,
-      postId,
-      levelId,
-      lease,
-      'confirmed',
-      'retry',
-    )
-    log(dependencies, 'info', {
-      event: 'reply_retried',
-      postId,
-      levelId,
-      stage: 'retry',
-      outcome: 'replied',
-    })
-    return {status: 'replied', levelId, commentId: comment.id}
+    comment = await dependencies.submitComment(postId, text)
   } catch (error) {
     if (error instanceof ProcessPostError) throw error
     await retainAfterAmbiguous(
@@ -654,6 +653,68 @@ async function reconcileAmbiguousSubmit(
     )
     return {status: 'ignored', reason: 'unresolved'}
   }
+  await retainOrThrow(
+    dependencies,
+    postId,
+    levelId,
+    lease,
+    'confirmed',
+    'retry',
+  )
+  log(dependencies, 'info', {
+    event: 'reply_retried',
+    postId,
+    levelId,
+    commentId: comment.id,
+    stage: 'retry',
+    outcome: 'replied',
+  })
+  await moderateSubmittedComment(dependencies, postId, levelId, comment)
+  return {status: 'replied', levelId, commentId: comment.id}
+}
+
+async function moderateSubmittedComment(
+  dependencies: ProcessDependencies,
+  postId: PostId,
+  levelId: string,
+  comment: SubmittedComment,
+): Promise<void> {
+  try {
+    await comment.distinguishAndSticky()
+  } catch {
+    log(dependencies, 'warn', {
+      event: 'moderation_retrying',
+      postId,
+      levelId,
+      commentId: comment.id,
+      stage: 'moderation',
+      outcome: 'retrying',
+    })
+    try {
+      await comment.distinguishAndSticky()
+    } catch {
+      log(dependencies, 'error', {
+        event: 'moderation_failed',
+        postId,
+        levelId,
+        commentId: comment.id,
+        stage: 'moderation',
+        outcome: 'failed',
+        category: 'moderation_failed',
+        summary: SAFE_SUMMARIES.moderation_failed,
+      })
+      return
+    }
+  }
+
+  log(dependencies, 'info', {
+    event: 'moderation_succeeded',
+    postId,
+    levelId,
+    commentId: comment.id,
+    stage: 'moderation',
+    outcome: 'succeeded',
+  })
 }
 
 async function retainAfterAmbiguous(

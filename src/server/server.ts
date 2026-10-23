@@ -262,7 +262,10 @@ function createProcessDependencies(): ProcessDependencies {
         text,
         runAs: 'APP',
       })
-      return {id: comment.id}
+      return {
+        id: comment.id,
+        distinguishAndSticky: () => comment.distinguish(true),
+      }
     },
     log: (severity, event) => emitLifecycleEvent(severity, event),
   }

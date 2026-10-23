@@ -2,3 +2,5 @@
 /dist/
 /public/*.js*
 /.env
+/.claude/
+/CLAUDE.md

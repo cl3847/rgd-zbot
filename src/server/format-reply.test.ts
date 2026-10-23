@@ -12,6 +12,7 @@ const LEVEL: LevelInfo = {
   description: 'A test description',
   creatorUsername: 'creator',
   difficulty: 'Hard',
+  rating: null,
   stars: 6,
   downloads: 1_234_567,
   likes: -1_234,
@@ -28,7 +29,7 @@ test('REPLY-01 and D-08/D-09 lock the complete reply bytes and footer', () => {
 > A test description
 
 Hard · 6★ · Long · 1,234,567 downloads · -1,234 likes  
-*Cool Song* by Some Artist
+*[Cool Song](https://www.newgrounds.com/audio/listen/999999)* by Some Artist
 
 ___
 
@@ -56,14 +57,25 @@ test('REPLY-01 groups downloads and preserves negative likes', () => {
   assert.ok(reply.includes('-1,234 likes'))
 })
 
-test('D-05/D-06/D-07 keep custom songs link-free with no visible ID', () => {
+test('links Newgrounds custom songs by song ID', () => {
   const reply = formatReply(LEVEL)
-  assert.ok(reply.includes('*Cool Song* by Some Artist'))
-  assert.equal(reply.includes('newgrounds.com'), false)
-  assert.equal(reply.includes('999999'), false)
+  assert.ok(
+    reply.includes(
+      '*[Cool Song](https://www.newgrounds.com/audio/listen/999999)* by Some Artist',
+    ),
+  )
+  assert.equal(reply.includes('(999999)'), false)
 })
 
-test('D-05/D-06/D-07 keep official songs link-free with no visible ID', () => {
+test('keeps music library and unresolved custom songs link-free', () => {
+  for (const songId of [10_000_000, 10_009_967, 0]) {
+    const reply = formatReply({...LEVEL, songId})
+    assert.ok(reply.includes('*Cool Song* by Some Artist'))
+    assert.equal(reply.includes('newgrounds.com'), false)
+  }
+})
+
+test('keeps official songs link-free with no visible ID', () => {
   const reply = formatReply({
     ...LEVEL,
     songName: 'Back on Track',
@@ -82,4 +94,36 @@ test('D-10 keeps the Phase 1 reply as plain parity Markdown', () => {
   assert.equal(reply.includes('<img'), false)
   assert.equal(reply.includes('!['), false)
   assert.ok(reply.includes('Hard · 6★ · Long'))
+})
+
+test('shows the rating in bold after the stars', () => {
+  for (const rating of ['Featured', 'Epic', 'Legendary', 'Mythic'] as const) {
+    const reply = formatReply({...LEVEL, rating})
+    assert.ok(reply.includes(`Hard · 6★ · **${rating}** · Long`))
+  }
+})
+
+test('escapes Markdown in player-written level text', () => {
+  const reply = formatReply({
+    ...LEVEL,
+    name: '[click](https://evil.example)',
+    creatorUsername: 'some_one',
+    description: 'u/spez **bold** \\[*0*]/ # heading',
+    songName: 'F-777 - Sonic Blaster',
+    songArtist: '^super ~~strike~~',
+  })
+  assert.ok(
+    reply.startsWith(
+      String.raw`**[\[click\]\(https\:\/\/evil\.example\)](https://gdbrowser.com/12345678)** by some\_one (12345678)`,
+    ),
+  )
+  assert.ok(
+    reply.includes(String.raw`> u\/spez \*\*bold\*\* \\\[\*0\*\]\/ \# heading`),
+  )
+  assert.ok(
+    reply.includes(
+      String.raw`*[F\-777 \- Sonic Blaster](https://www.newgrounds.com/audio/listen/999999)* by \^super \~\~strike\~\~`,
+    ),
+  )
+  assert.equal(reply.includes('](https://evil'), false)
 })

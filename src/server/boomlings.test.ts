@@ -267,6 +267,29 @@ test('LOOKUP-03 maps every difficulty and honors demon then auto precedence', as
   }
 })
 
+test('resolves the rating from the epic tier, then the featured score', async t => {
+  const cases: ReadonlyArray<readonly [Record<string, string>, string | null]> =
+    [
+      [{}, null],
+      [{'19': '0'}, null],
+      [{'19': '-1'}, null],
+      [{'19': '3206'}, 'Featured'],
+      [{'19': '30568', '42': '1'}, 'Epic'],
+      [{'19': '37751', '42': '2'}, 'Legendary'],
+      [{'19': '40481', '42': '3'}, 'Mythic'],
+      [{'19': '3206', '42': '9'}, 'Featured'],
+    ]
+
+  for (const [fields, expected] of cases) {
+    await t.test(`${JSON.stringify(fields)} -> ${expected}`, async () => {
+      const level = await lookupLevel(LEVEL_ID, async () =>
+        response(levelResponse(fields)),
+      )
+      assert.equal(level?.rating, expected)
+    })
+  }
+})
+
 test('LOOKUP-04 maps every length and the unknown fallback', async () => {
   const cases = ['Tiny', 'Short', 'Medium', 'Long', 'XL', 'Platformer'] as const
   for (const [value, expected] of cases.entries()) {

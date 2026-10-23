@@ -33,12 +33,15 @@ const OFFICIAL_SONGS = [
   'Dash',
 ] as const
 
+export type LevelRating = 'Featured' | 'Epic' | 'Legendary' | 'Mythic'
+
 export type LevelInfo = {
   readonly id: string
   readonly name: string
   readonly description: string
   readonly creatorUsername: string
   readonly difficulty: string
+  readonly rating: LevelRating | null
   readonly stars: number
   readonly downloads: number
   readonly likes: number
@@ -129,6 +132,7 @@ export async function lookupLevel(
     description: decodeDescription(values.get('3')),
     creatorUsername,
     difficulty: resolveDifficulty(values),
+    rating: resolveRating(values),
     stars: parseUnsigned(values.get('18')),
     downloads: parseUnsigned(values.get('10')),
     likes: parseSigned(values.get('14')),
@@ -250,6 +254,19 @@ function resolveLength(values: ReadonlyMap<string, string>): string {
     '5': 'Platformer',
   }
   return lengths[values.get('15') ?? ''] ?? 'Unknown'
+}
+
+function resolveRating(
+  values: ReadonlyMap<string, string>,
+): LevelRating | null {
+  const ratings: Readonly<Record<string, LevelRating>> = {
+    '1': 'Epic',
+    '2': 'Legendary',
+    '3': 'Mythic',
+  }
+  const rating = ratings[values.get('42') ?? '']
+  if (rating) return rating
+  return parseSigned(values.get('19')) > 0 ? 'Featured' : null
 }
 
 function resolveSong(
